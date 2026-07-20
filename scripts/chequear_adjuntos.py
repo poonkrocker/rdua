@@ -1,39 +1,34 @@
 """
-Chequeo liviano de adjuntos rotos en RDU.
+Chequeo de adjuntos rotos en RDU a partir de una lista de Excel.
 
-A diferencia de main.py (que abre cada ítem con Playwright, llama a una IA y
-necesita login para EDITAR), este script solo LEE — nunca escribe ni modifica
-nada en RDU. El resultado es un reporte en CSV (reportes/adjuntos_rotos.csv)
-para revisar a mano, marcado con [ADJUNTO NO FUNCIONA].
+Vos controlás EXACTAMENTE qué ítems se revisan: pegás el link (o el handle)
+de cada uno en la columna "Link" de reportes/entradas_a_revisar.xlsx, y el
+script solo chequea esas filas — nada de recorrer todo el repositorio ni
+filtrar por tipo/año contra el buscador. Por cada fila, deja el resultado
+(Estado / Detalle / Bytes / ÚltimoChequeo) en las columnas de al lado, en el
+mismo archivo. No modifica nada en RDU: es de solo lectura.
 
-Tres chequeos, todos filtrables por tipo de ítem y rango de años (variables
-TIPOS / ANIO_DESDE / ANIO_HASTA):
-  1. RÁPIDO (siempre completo, cada corrida): ítems PÚBLICOS sin NINGÚN
-     archivo en el bundle ORIGINAL. Usa el filtro nativo de DSpace
-     `has_content_in_original_bundle=false`, así que es liviano sin importar
-     el tamaño del repositorio. No requiere login.
-  2. GRADUAL (avanza de a tramos, con checkpoint): recorre los ítems
-     PÚBLICOS que sí tienen archivo pero pesa UMBRAL_BYTES_VACIO bytes o
-     menos (los vacíos observados en RDU pesan 42 bytes). Pedirle a la API
-     los bitstreams de cada ítem es lento del lado del servidor, así que
-     recorrer TODO el repositorio de una sola corrida sería demasiado lento.
-     Por eso cada corrida procesa hasta MAX_PAGINAS_POR_CORRIDA páginas y
-     guarda dónde quedó en reportes/checkpoint_adjuntos.txt; la corrida
-     siguiente retoma ahí, y al llegar al final vuelve a arrancar. No
-     requiere login (usa la búsqueda pública).
-  3. WORKFLOW (opcional, solo si hay RDU_USER/RDU_PASS configurados): ítems
-     que TODAVÍA NO son públicos porque están en el circuito de revisión de
-     DSpace (enviados, en aprobación) — esos no aparecen en la búsqueda
-     anónima, así que hace falta autenticarse contra la API con las mismas
-     credenciales que ya usa main.py. Este chequeo es best-effort: si algo
-     falla (credenciales ausentes, permisos insuficientes, forma de
-     respuesta inesperada), lo avisa por log y NO hace fallar el resto del
-     script — los chequeos 1 y 2 se guardan igual.
+La columna "Link" acepta cualquier forma en la que lo hayas copiado:
+  - link completo con handle:  https://rdu.unc.edu.ar/handle/11086/29993
+  - link completo con uuid:    https://rdu.unc.edu.ar/items/<uuid>
+  - el handle pelado:          11086/29993
+  - el uuid pelado
+
+Si el archivo de entradas no existe todavía, el script lo crea vacío (con
+los encabezados) y termina — pegá los links y volvé a correrlo.
+
+Además, opcionalmente (solo si hay RDU_USER/RDU_PASS configurados como
+secrets), chequea los ítems que están en el circuito de revisión de DSpace
+(todavía no públicos, por eso no tienen un link "normal" para poner en el
+Excel) y deja el resultado en reportes/adjuntos_rotos_en_revision.csv. Es
+best-effort: si falla algo ahí (permisos, endpoint), se avisa por log sin
+afectar el chequeo del Excel.
 """
 import csv
 import http.cookiejar
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -41,42 +36,37 @@ import urllib.parse
 import urllib.request
 from datetime import date
 
+import openpyxl
+
 BASE_URL = os.environ.get("RDU_BASE_URL", "https://rdu.unc.edu.ar").rstrip("/")
 API = f"{BASE_URL}/server/api"
 
-TAMANO_PAGINA = int(os.environ.get("TAMANO_PAGINA", "20"))
-MAX_PAGINAS_POR_CORRIDA = int(os.environ.get("MAX_PAGINAS_POR_CORRIDA", "150"))
 UMBRAL_BYTES_VACIO = int(os.environ.get("UMBRAL_BYTES_VACIO", "42"))
 PAUSA_SEGUNDOS = float(os.environ.get("PAUSA_SEGUNDOS", "0.3"))  # para no saturar el servidor
 REINTENTOS = int(os.environ.get("REINTENTOS", "3"))
 
-# Filtros opcionales. TIPOS: valores de dc.type separados por coma (ej.
-# "doctoralThesis,masterThesis"), vacío = todos. ANIO_DESDE/ANIO_HASTA:
-# años de dc.date.issued, cualquiera de los dos puede quedar vacío para
-# dejar el rango abierto de ese lado.
-TIPOS = [t.strip() for t in os.environ.get("TIPOS", "").split(",") if t.strip()]
-ANIO_DESDE = os.environ.get("ANIO_DESDE", "").strip()
-ANIO_HASTA = os.environ.get("ANIO_HASTA", "").strip()
-
 DIR_REPORTES = "reportes"
-ARCHIVO_CHECKPOINT = os.path.join(DIR_REPORTES, "checkpoint_adjuntos.txt")
-ARCHIVO_REPORTE = os.path.join(DIR_REPORTES, "adjuntos_rotos.csv")
-
-CAMPOS_REPORTE = ["handle", "titulo", "tipo", "problema", "bytes", "link", "detectado"]
+ARCHIVO_ENTRADAS = os.environ.get("ARCHIVO_ENTRADAS", os.path.join(DIR_REPORTES, "entradas_a_revisar.xlsx"))
+ARCHIVO_REPORTE_WORKFLOW = os.path.join(DIR_REPORTES, "adjuntos_rotos_en_revision.csv")
 
 MARCA = "[ADJUNTO NO FUNCIONA]"
 
+COLUMNAS_ENTRADAS = ["Link", "Titulo", "Estado", "Detalle", "Bytes", "UltimoChequeo"]
+CAMPOS_REPORTE_WORKFLOW = ["handle", "titulo", "tipo", "problema", "bytes", "link", "detectado"]
+
 # Algunos WAF/firewalls institucionales cortan la conexión sin responder
-# (síntoma: "Remote end closed connection without response") cuando ven el
-# user-agent por defecto de Python ("Python-urllib/3.x"), porque lo
-# reconocen como firma de bot. Mandamos cabeceras de navegador real para
-# evitarlo.
+# cuando ven el user-agent por defecto de Python ("Python-urllib/3.x"),
+# porque lo reconocen como firma de bot. Mandamos cabeceras de navegador
+# real para evitarlo.
 CABECERAS_BASE = {
     "Accept": "application/json",
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
     "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
 }
+
+_RE_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", re.IGNORECASE)
+_RE_HANDLE = re.compile(r"\b(\d+/\d+)\b")
 
 
 # ---------- HTTP CON REINTENTOS ----------
@@ -103,92 +93,14 @@ def _get(url: str, opener=None) -> dict:
     return json.loads(resp.read())
 
 
-def _link(handle: str) -> str:
-    return f"{BASE_URL}/handle/{handle}"
-
-
 def _metadata(item: dict, campo: str) -> str:
     valores = item.get("metadata", {}).get(campo, [])
     return "; ".join(v.get("value", "") for v in valores if v.get("value"))
 
 
-# ---------- FILTRO POR TIPO / AÑO ----------
-def _query_filtro() -> str | None:
-    partes = []
-    if TIPOS:
-        partes.append("itemtype:(" + " OR ".join(TIPOS) + ")")
-    if ANIO_DESDE or ANIO_HASTA:
-        # OJO: el rango va con años pelados ("[2014 TO 2014]"), NO con fechas
-        # completas ("2014-01-01"). RDU indexa la mayoría de los ítems solo
-        # con el año, y un rango con fecha completa no matchea esos valores
-        # (probado contra la API real: [2014-01-01 TO 2014-12-31] da 0
-        # resultados, [2014 TO 2014] da el conteo correcto). "*" deja ese
-        # extremo del rango abierto.
-        desde = ANIO_DESDE or "*"
-        hasta = ANIO_HASTA or "*"
-        partes.append(f"dateIssued:[{desde} TO {hasta}]")
-    return " AND ".join(partes) if partes else None
-
-
-def _url_discover(extra: str, size: int, pagina: int) -> str:
-    url = f"{API}/discover/search/objects?dsoType=item&{extra}&size={size}&page={pagina}"
-    query = _query_filtro()
-    if query:
-        url += f"&query={urllib.parse.quote(query, safe='')}"
-    return url
-
-
-def _item_cumple_filtro(item: dict) -> bool:
-    """Para chequeos que NO pasan por la búsqueda (ej. workflow), aplica el
-    mismo filtro de tipo/año a mano sobre los metadatos del ítem."""
-    if TIPOS:
-        tipo = _metadata(item, "dc.type")
-        if tipo not in TIPOS:
-            return False
-    if ANIO_DESDE or ANIO_HASTA:
-        fecha = _metadata(item, "dc.date.issued")[:4]
-        if not fecha.isdigit():
-            return False
-        anio = int(fecha)
-        if ANIO_DESDE and anio < int(ANIO_DESDE):
-            return False
-        if ANIO_HASTA and anio > int(ANIO_HASTA):
-            return False
-    return True
-
-
-# ---------- REPORTE ----------
-def _leer_reporte() -> dict:
-    if not os.path.exists(ARCHIVO_REPORTE):
-        return {}
-    with open(ARCHIVO_REPORTE, newline="", encoding="utf-8") as f:
-        return {fila["handle"]: fila for fila in csv.DictReader(f)}
-
-
-def _guardar_reporte(filas: dict):
-    os.makedirs(DIR_REPORTES, exist_ok=True)
-    with open(ARCHIVO_REPORTE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CAMPOS_REPORTE)
-        writer.writeheader()
-        for handle in sorted(filas):
-            writer.writerow(filas[handle])
-
-
-def _fila_para(item: dict, problema: str, tam: int, handle_alternativo: str = "") -> dict:
-    handle = item.get("handle") or handle_alternativo
-    return {
-        "handle": handle,
-        "titulo": item.get("name", ""),
-        "tipo": _metadata(item, "dc.type"),
-        "problema": f"{MARCA} {problema}",
-        "bytes": tam,
-        "link": _link(handle) if handle else "(sin handle: revisar en el panel de RDU)",
-        "detectado": date.today().isoformat(),
-    }
-
-
 def _evaluar_bundle_original(item: dict):
-    """Devuelve (problema, bytes) si el adjunto ORIGINAL está roto, o None si está OK."""
+    """Devuelve (problema, bytes) si el adjunto ORIGINAL está roto, o (None, bytes) si está OK
+    (el tamaño devuelto cuando está OK es informativo, el del archivo más grande del bundle)."""
     bundles = item.get("_embedded", {}).get("bundles", {}).get("_embedded", {}).get("bundles", [])
     original = next((b for b in bundles if b.get("name") == "ORIGINAL"), None)
     if not original:
@@ -208,111 +120,171 @@ def _evaluar_bundle_original(item: dict):
         if tam <= UMBRAL_BYTES_VACIO:
             return "ADJUNTO VACÍO/ROTO", tam
 
+    return None, max(b.get("sizeBytes", 0) for b in bitstreams)
+
+
+# ---------- RESOLVER UN LINK/HANDLE/UUID PEGADO A MANO A UN ÍTEM DE RDU ----------
+def _extraer_identificador(texto: str):
+    """A partir de lo que se pegó en la columna Link, devuelve ("uuid", valor)
+    o ("handle", valor). Acepta link completo (con /items/<uuid> o
+    /handle/<prefijo>/<sufijo>), o el uuid/handle pelado. None si no se
+    pudo interpretar nada."""
+    texto = (texto or "").strip()
+    if not texto:
+        return None
+
+    m = re.search(r"/handle/(\d+/\d+)", texto)
+    if m:
+        return ("handle", m.group(1))
+
+    m_uuid = _RE_UUID.search(texto)
+    if m_uuid and ("/items/" in texto.lower() or texto.lower() == m_uuid.group(0).lower()):
+        return ("uuid", m_uuid.group(0))
+
+    m = _RE_HANDLE.search(texto)
+    if m:
+        return ("handle", m.group(1))
+
+    if m_uuid:
+        return ("uuid", m_uuid.group(0))
+
     return None
 
 
-# ---------- CHEQUEO 1: RÁPIDO, ítems públicos sin ningún archivo original ----------
-def chequeo_rapido(filas_reporte: dict):
-    print("[RÁPIDO] Buscando ítems públicos sin ningún archivo en el bundle ORIGINAL...")
-    encontrados_ahora = set()
-    pagina = 0
-    while True:
-        url = _url_discover("f.has_content_in_original_bundle=false,equals", 100, pagina)
-        data = _get(url)
-        resultado = data["_embedded"]["searchResult"]
-        objetos = resultado["_embedded"].get("objects", [])
-        for obj in objetos:
-            item = obj["_embedded"]["indexableObject"]
-            handle = item.get("handle", "")
-            encontrados_ahora.add(handle)
-            filas_reporte[handle] = _fila_para(item, "SIN ARCHIVO ADJUNTO", 0)
-        total_paginas = resultado["page"]["totalPages"]
-        pagina += 1
-        if pagina >= total_paginas:
-            break
-
-    # Sacar del reporte los que ya no figuran sin adjunto (se cargó el archivo mientras tanto).
-    resueltos = [h for h, fila in list(filas_reporte.items())
-                 if fila["problema"] == f"{MARCA} SIN ARCHIVO ADJUNTO" and h not in encontrados_ahora]
-    for h in resueltos:
-        del filas_reporte[h]
-
-    extra = f" ({len(resueltos)} resuelto(s) desde la última corrida)" if resueltos else ""
-    print(f"[RÁPIDO] {len(encontrados_ahora)} ítem(s) sin ningún archivo adjunto{extra}.")
+def _resolver_item(tipo: str, valor: str) -> dict | None:
+    if tipo == "handle":
+        data = _get(f"{API}/pid/find?id={urllib.parse.quote(valor, safe='')}")
+        uuid = data.get("uuid") if data else None
+        if not uuid:
+            return None
+    else:
+        uuid = valor
+    return _get(f"{API}/core/items/{uuid}?embed=bundles/bitstreams")
 
 
-# ---------- CHEQUEO 2: GRADUAL, recorre los ítems públicos buscando adjuntos rotos ----------
-def _leer_checkpoint() -> int:
-    if not os.path.exists(ARCHIVO_CHECKPOINT):
-        return 0
-    try:
-        return int(open(ARCHIVO_CHECKPOINT, encoding="utf-8").read().strip())
-    except ValueError:
-        return 0
+# ---------- CHEQUEO PRINCIPAL: LOS ÍTEMS QUE PUSISTE EN EL EXCEL ----------
+def _crear_planilla_vacia():
+    os.makedirs(os.path.dirname(ARCHIVO_ENTRADAS) or ".", exist_ok=True)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Entradas"
+    ws.append(COLUMNAS_ENTRADAS)
+    wb.save(ARCHIVO_ENTRADAS)
+    print(f"No existía {ARCHIVO_ENTRADAS}; se creó vacío con los encabezados: "
+          f"{', '.join(COLUMNAS_ENTRADAS)}.")
+    print("Pegá los links (o handles) a revisar en la columna 'Link' y volvé a correr el workflow.")
 
 
-def _guardar_checkpoint(pagina: int):
-    os.makedirs(DIR_REPORTES, exist_ok=True)
-    with open(ARCHIVO_CHECKPOINT, "w", encoding="utf-8") as f:
-        f.write(str(pagina))
+def _indices_columnas(ws) -> dict:
+    """Lee la fila de encabezados; agrega las columnas que falten al final."""
+    encabezados = [c.value for c in ws[1]] if ws.max_row >= 1 else []
+    indices = {}
+    for nombre in COLUMNAS_ENTRADAS:
+        if nombre not in encabezados:
+            col = len(encabezados) + 1
+            ws.cell(row=1, column=col, value=nombre)
+            encabezados.append(nombre)
+        indices[nombre] = encabezados.index(nombre) + 1
+    return indices
 
 
-def chequeo_gradual(filas_reporte: dict):
-    pagina = _leer_checkpoint()
-    print(f"[GRADUAL] Retomando desde la página {pagina} (tamaño de página {TAMANO_PAGINA}).")
+def _escribir_resultado_fila(ws, indices: dict, fila: int, estado: str, detalle: str, tam, titulo: str = None):
+    if titulo is not None and indices.get("Titulo"):
+        ws.cell(row=fila, column=indices["Titulo"], value=titulo)
+    ws.cell(row=fila, column=indices["Estado"], value=estado)
+    ws.cell(row=fila, column=indices["Detalle"], value=detalle)
+    ws.cell(row=fila, column=indices["Bytes"], value=tam)
+    ws.cell(row=fila, column=indices["UltimoChequeo"], value=date.today().isoformat())
 
-    total_paginas = None
-    paginas_procesadas = 0
-    rotos_detectados = 0
-    resueltos = 0
 
-    while paginas_procesadas < MAX_PAGINAS_POR_CORRIDA:
-        url = _url_discover("embed=bundles/bitstreams", TAMANO_PAGINA, pagina)
+def chequeo_desde_excel():
+    if not os.path.exists(ARCHIVO_ENTRADAS):
+        _crear_planilla_vacia()
+        return
+
+    wb = openpyxl.load_workbook(ARCHIVO_ENTRADAS)
+    ws = wb.active
+    indices = _indices_columnas(ws)
+
+    total = 0
+    rotos = 0
+    ok = 0
+    errores = 0
+
+    for fila in range(2, ws.max_row + 1):
+        link = str(ws.cell(row=fila, column=indices["Link"]).value or "").strip()
+        if not link:
+            continue
+        total += 1
+
+        identificador = _extraer_identificador(link)
+        if not identificador:
+            _escribir_resultado_fila(ws, indices, fila, "ERROR", "No se pudo interpretar el link/handle pegado", "")
+            errores += 1
+            print(f"  [ERROR] Fila {fila}: no se pudo interpretar '{link}'")
+            continue
+
         try:
-            data = _get(url)
+            item = _resolver_item(*identificador)
         except Exception as e:
-            print(f"  [WARN] Falló la página {pagina} tras varios intentos: {e}. Se retoma en la próxima corrida.")
-            break
+            _escribir_resultado_fila(ws, indices, fila, "ERROR", f"Falló la consulta a RDU: {e}", "")
+            errores += 1
+            print(f"  [ERROR] Fila {fila} ({link}): {e}")
+            continue
 
-        resultado = data["_embedded"]["searchResult"]
-        total_paginas = resultado["page"]["totalPages"]
-        if total_paginas == 0:
-            print("  [GRADUAL] El filtro de tipo/año actual no matchea ningún ítem público. Nada para revisar.")
-            pagina = 0
-            break
-        objetos = resultado["_embedded"].get("objects", [])
+        if not item:
+            _escribir_resultado_fila(ws, indices, fila, "ERROR", "No se encontró ese ítem en RDU", "")
+            errores += 1
+            print(f"  [ERROR] Fila {fila}: no se encontró el ítem para '{link}'")
+            continue
 
-        for obj in objetos:
-            item = obj["_embedded"]["indexableObject"]
-            handle = item.get("handle", "")
-            evaluacion = _evaluar_bundle_original(item)
-            if evaluacion:
-                problema, tam = evaluacion
-                filas_reporte[handle] = _fila_para(item, problema, tam)
-                rotos_detectados += 1
-                print(f"  {MARCA} {handle} — {problema} ({tam} bytes) — {item.get('name', '')}")
-            elif handle in filas_reporte:
-                del filas_reporte[handle]  # ya no está roto (se corrigió desde el último paso por acá)
-                resueltos += 1
+        titulo = item.get("name", "")
+        problema, tam = _evaluar_bundle_original(item)
+        if problema:
+            _escribir_resultado_fila(ws, indices, fila, MARCA, problema, tam, titulo=titulo)
+            rotos += 1
+            print(f"  {MARCA} fila {fila} ({item.get('handle', link)}): {problema} ({tam} bytes) — {titulo}")
+        else:
+            _escribir_resultado_fila(ws, indices, fila, "OK", "", tam, titulo=titulo)
+            ok += 1
 
-        paginas_procesadas += 1
-        pagina += 1
-        if pagina >= total_paginas:
-            print("  [GRADUAL] Se completó una vuelta entera al filtro actual en esta corrida.")
-            pagina = 0
-            break  # no tiene sentido volver a recorrer el mismo filtro de nuevo en la misma corrida
         time.sleep(PAUSA_SEGUNDOS)
 
-    _guardar_checkpoint(pagina)
-    print(f"[GRADUAL] {paginas_procesadas} página(s) procesada(s) esta corrida "
-          f"({paginas_procesadas * TAMANO_PAGINA} ítems). "
-          f"Rotos detectados: {rotos_detectados}. Resueltos desde la última vez: {resueltos}.")
-    if total_paginas:
-        avance = min(100.0, round(pagina / total_paginas * 100, 1)) if total_paginas else 100.0
-        print(f"[GRADUAL] Próxima corrida retoma en la página {pagina} de {total_paginas} (~{avance}% del ciclo).")
+    wb.save(ARCHIVO_ENTRADAS)
+    print(f"[EXCEL] {total} entrada(s) revisada(s): {ok} OK, {rotos} rota(s), {errores} con error. "
+          f"Guardado en {ARCHIVO_ENTRADAS}.")
 
 
-# ---------- CHEQUEO 3: WORKFLOW, ítems todavía no públicos (requiere login) ----------
+# ---------- CHEQUEO OPCIONAL: ÍTEMS EN REVISIÓN (TODAVÍA NO PÚBLICOS, requiere login) ----------
+def _leer_reporte_workflow() -> dict:
+    if not os.path.exists(ARCHIVO_REPORTE_WORKFLOW):
+        return {}
+    with open(ARCHIVO_REPORTE_WORKFLOW, newline="", encoding="utf-8") as f:
+        return {fila["handle"]: fila for fila in csv.DictReader(f)}
+
+
+def _guardar_reporte_workflow(filas: dict):
+    os.makedirs(DIR_REPORTES, exist_ok=True)
+    with open(ARCHIVO_REPORTE_WORKFLOW, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CAMPOS_REPORTE_WORKFLOW)
+        writer.writeheader()
+        for handle in sorted(filas):
+            writer.writerow(filas[handle])
+
+
+def _fila_reporte_workflow(item: dict, problema: str, tam: int, handle_alternativo: str = "") -> dict:
+    handle = item.get("handle") or handle_alternativo
+    return {
+        "handle": handle,
+        "titulo": item.get("name", ""),
+        "tipo": _metadata(item, "dc.type"),
+        "problema": f"{MARCA} {problema} (EN REVISIÓN, no público)",
+        "bytes": tam,
+        "link": f"{BASE_URL}/handle/{handle}" if item.get("handle") else "(sin handle: revisar en el panel de RDU)",
+        "detectado": date.today().isoformat(),
+    }
+
+
 def _login_rdu():
     """Autentica contra la API de RDU. Devuelve un opener de urllib listo para
     usar en pedidos autenticados, o None si no hay credenciales o el login
@@ -326,8 +298,6 @@ def _login_rdu():
     cj = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
 
-    # 1) Pedir el token CSRF: viene en el header DSPACE-XSRF-TOKEN y además
-    #    DSpace deja la cookie correspondiente guardada en el cookiejar.
     req = urllib.request.Request(f"{API}/authn/status", headers=CABECERAS_BASE)
     resp = _abrir_con_reintentos(opener, req)
     xsrf = resp.headers.get("DSPACE-XSRF-TOKEN")
@@ -335,7 +305,6 @@ def _login_rdu():
         print("[WORKFLOW] No se pudo obtener el token CSRF de RDU; se omite el chequeo de ítems en revisión.")
         return None
 
-    # 2) Login. La cookie CSRF ya está en el cookiejar del opener.
     body = urllib.parse.urlencode({"user": usuario, "password": clave}).encode()
     req = urllib.request.Request(
         f"{API}/authn/login", data=body, method="POST",
@@ -361,14 +330,14 @@ def _login_rdu():
     return opener
 
 
-def chequeo_workflow(filas_reporte: dict):
+def chequeo_workflow():
     """Revisa ítems que todavía están en el circuito de revisión de DSpace
-    (no públicos). Best-effort: cualquier error (incluido el login) se
-    loguea y se sigue de largo sin hacer fallar el resto del script — la
-    forma exacta de esta respuesta no se pudo confirmar contra un ítem real
-    en revisión, así que si falla, avisá el mensaje de [WARN]/[ERROR] para
-    ajustar el endpoint."""
+    (no públicos, por eso no tienen un link para poner en el Excel).
+    Best-effort: cualquier error (incluido el login o un 403 por falta de
+    permisos de revisor/admin en la cuenta) se loguea y no afecta el
+    chequeo del Excel."""
     print("[WORKFLOW] Buscando ítems en revisión (no públicos) con adjunto roto...")
+    filas_reporte = _leer_reporte_workflow()
     try:
         opener = _login_rdu()
         if not opener:
@@ -387,13 +356,10 @@ def chequeo_workflow(filas_reporte: dict):
                 item = wi.get("_embedded", {}).get("item")
                 if not item:
                     continue
-                if not _item_cumple_filtro(item):
-                    continue
                 handle = item.get("handle") or f"workflow-{wi.get('id', '')}"
-                evaluacion = _evaluar_bundle_original(item)
-                if evaluacion:
-                    problema, tam = evaluacion
-                    filas_reporte[handle] = _fila_para(item, f"{problema} (EN REVISIÓN, no público)", tam, handle)
+                problema, tam = _evaluar_bundle_original(item)
+                if problema:
+                    filas_reporte[handle] = _fila_reporte_workflow(item, problema, tam, handle)
                     encontrados += 1
                     print(f"  {MARCA} {handle} — {problema} (en revisión) — {item.get('name', '')}")
 
@@ -407,37 +373,25 @@ def chequeo_workflow(filas_reporte: dict):
         print(f"[WORKFLOW] {encontrados} ítem(s) en revisión con adjunto roto.")
     except Exception as e:
         print(f"[WORKFLOW] [ERROR] No se pudo completar el chequeo de ítems en revisión: {e}. "
-              f"Se ignora y se sigue con el resto (puede que el endpoint o el formato de "
-              f"respuesta necesiten ajuste — revisar scripts/chequear_adjuntos.py::chequeo_workflow).")
+              f"Puede ser un problema de permisos (la cuenta necesita rol de revisor/admin en RDU "
+              f"para ver la cola de workflow) o que el endpoint/formato necesite ajuste.")
+    finally:
+        _guardar_reporte_workflow(filas_reporte)
 
 
 def main():
-    if TIPOS:
-        print(f"Filtro de tipo activo: {', '.join(TIPOS)}")
-    if ANIO_DESDE or ANIO_HASTA:
-        print(f"Filtro de año activo: {ANIO_DESDE or '(sin mínimo)'} a {ANIO_HASTA or '(sin máximo)'}")
-
-    filas_reporte = _leer_reporte()
-
-    # Cada chequeo es independiente: si uno falla (ej. la API no responde en
-    # ese momento), los otros dos igual corren y el reporte se guarda con lo
-    # que sí se pudo juntar. Al final, si hubo algún fallo, el script termina
-    # con código de error para que quede visible en Actions — pero SIN perder
-    # el progreso ya guardado.
     hubo_fallas = False
-    for nombre, chequeo in (
-        ("rápido", chequeo_rapido),
-        ("gradual", chequeo_gradual),
-        ("workflow", chequeo_workflow),
-    ):
-        try:
-            chequeo(filas_reporte)
-        except Exception as e:
-            hubo_fallas = True
-            print(f"[ERROR] El chequeo '{nombre}' falló y se omitió el resto de esa sección: {e}")
+    try:
+        chequeo_desde_excel()
+    except Exception as e:
+        hubo_fallas = True
+        print(f"[ERROR] El chequeo del Excel falló: {e}")
 
-    _guardar_reporte(filas_reporte)
-    print(f"\nReporte actualizado: {ARCHIVO_REPORTE} ({len(filas_reporte)} ítem(s) con adjunto roto).")
+    try:
+        chequeo_workflow()
+    except Exception as e:
+        hubo_fallas = True
+        print(f"[ERROR] El chequeo de workflow falló: {e}")
 
     if hubo_fallas:
         sys.exit(1)

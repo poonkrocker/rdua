@@ -2,32 +2,14 @@ name: Chequear adjuntos rotos RDU
 
 on:
   schedule:
-    # Cada 3 horas. El chequeo "gradual" avanza de a tramos (ver
-    # scripts/chequear_adjuntos.py), así que con esta frecuencia el
-    # repositorio completo (dentro del filtro configurado abajo) queda
-    # re-revisado cada uno o dos días.
-    - cron: "0 */3 * * *"
-  workflow_dispatch:
-    inputs:
-      tipos:
-        description: "Tipos a revisar (dc.type separados por coma, ej. doctoralThesis,masterThesis). Vacío = todos."
-        required: false
-        default: ""
-      anio_desde:
-        description: "Año desde (dc.date.issued). Vacío = sin mínimo."
-        required: false
-        default: ""
-      anio_hasta:
-        description: "Año hasta (dc.date.issued). Vacío = sin máximo."
-        required: false
-        default: ""
-      max_paginas:
-        description: "Páginas a procesar en esta corrida (chequeo gradual, tamaño de página 20)"
-        required: false
-        default: "150"
+    # Una vez por día. Cada corrida revisa TODA la lista de
+    # reportes/entradas_a_revisar.xlsx de punta a punta (vos controlás el
+    # universo a revisar editando ese archivo).
+    - cron: "0 9 * * *"
+  workflow_dispatch: {}
 
 permissions:
-  contents: write  # necesario para commitear el reporte y el checkpoint actualizados
+  contents: write  # necesario para commitear el Excel y el reporte actualizados
 
 jobs:
   chequear:
@@ -57,21 +39,21 @@ jobs:
           echo "===== curl a la home pública (sin /server/api) ====="
           curl -s -o /dev/null -w "status=%{http_code}\n" "https://rdu.unc.edu.ar/" || true
 
+      - name: Instalar dependencias
+        # Solo openpyxl (para leer/escribir el Excel): el resto del script
+        # es librería estándar de Python, no necesita Playwright ni IA.
+        run: pip install openpyxl==3.1.5
+
       - name: Ejecutar chequeo de adjuntos
-        # Sin pip install: el script solo usa librería estándar de Python
-        # (no necesita Playwright ni IA). RDU_USER/RDU_PASS son los mismos
-        # secrets que ya usa "Procesar items RDU" — si no están cargados acá,
-        # el chequeo de ítems en revisión (workflow) se omite solo, sin error.
+        # RDU_USER/RDU_PASS son los mismos secrets que ya usa "Procesar items
+        # RDU" — si no están cargados acá, el chequeo de ítems en revisión
+        # (workflow) se omite solo, sin error.
         env:
-          TIPOS: ${{ github.event.inputs.tipos || '' }}
-          ANIO_DESDE: ${{ github.event.inputs.anio_desde || '' }}
-          ANIO_HASTA: ${{ github.event.inputs.anio_hasta || '' }}
-          MAX_PAGINAS_POR_CORRIDA: ${{ github.event.inputs.max_paginas || '150' }}
           RDU_USER: ${{ secrets.RDU_USER }}
           RDU_PASS: ${{ secrets.RDU_PASS }}
         run: python scripts/chequear_adjuntos.py
 
-      - name: Guardar reporte y checkpoint actualizados
+      - name: Guardar Excel y reporte actualizados
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
