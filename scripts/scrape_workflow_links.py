@@ -131,30 +131,53 @@ def get_json(client, url, params=None, intentos=4):
     raise ultimo
 
 
+def _titulo_de_sections(wfi):
+    """Saca dc.title de las sections del workflowitem (traditionalpageone, etc.)."""
+    for sec in (wfi.get("sections") or {}).values():
+        if isinstance(sec, dict) and sec.get("dc.title"):
+            v = sec["dc.title"]
+            if isinstance(v, list) and v:
+                return v[0].get("value", "") if isinstance(v[0], dict) else str(v[0])
+    return ""
+
+
 def extraer(obj):
-    """De un indexableObject saca id de workflow, uuid del item y titulo."""
-    emb = obj.get("_embedded", {}) or {}
-    item = emb.get("item") or emb.get("workflowitem", {}).get("_embedded", {}).get("item")
-
-    wf_id = obj.get("id")
+    """
+    De un indexableObject saca id del workflowitem, uuid del item y titulo.
+    En configuration=workflow el objeto suele ser claimedtask/pooltask,
+    que ENVUELVE al workflowitem (el id que sirve para el link es el de adentro).
+    """
     tipo = (obj.get("type") or "").lower()
+    emb = obj.get("_embedded", {}) or {}
 
-    # si el objeto YA es el item, no hay wf_id util
-    if tipo == "item":
-        item = obj
-        wf_id = ""
+    if tipo in ("claimedtask", "pooltask"):
+        wfi = emb.get("workflowitem") or {}
+        tarea_id = obj.get("id", "")
+    elif tipo in ("workflowitem", "workspaceitem"):
+        wfi = obj
+        tarea_id = ""
+    else:                       # por las dudas: el objeto ya es el item
+        wfi = {}
+        tarea_id = ""
 
-    md = (item or {}).get("metadata", {}) or {}
+    wf_id = wfi.get("id", "")
+    item = (wfi.get("_embedded", {}) or {}).get("item") or (emb.get("item") if not wfi else None) or {}
+
+    md = item.get("metadata", {}) or {}
     titulo = ""
-    if "dc.title" in md and md["dc.title"]:
+    if md.get("dc.title"):
         titulo = md["dc.title"][0].get("value", "")
+    if not titulo:
+        titulo = _titulo_de_sections(wfi)
 
+    uuid = item.get("uuid", "")
     return {
+        "tarea_id": tarea_id,
         "workflowitem_id": wf_id,
-        "item_uuid": (item or {}).get("uuid", ""),
+        "item_uuid": uuid,
         "titulo": titulo,
         "link_workflow": f"{BASE}/workflowitems/{wf_id}/edit" if wf_id else "",
-        "link_item": f"{BASE}/items/{(item or {}).get('uuid')}" if item and item.get("uuid") else "",
+        "link_item": f"{BASE}/items/{uuid}" if uuid else "",
     }
 
 
@@ -182,8 +205,11 @@ def main():
                       f"en {info.get('totalPages')} paginas", file=sys.stderr)
 
             if DEBUG and objetos:
-                print(json.dumps(objetos[0], ensure_ascii=False, indent=2)[:4000])
-                sys.exit("DEBUG: corto aca (primer objeto volcado arriba).")
+                io = objetos[0]["_embedded"]["indexableObject"]
+                print(json.dumps(io, ensure_ascii=False, indent=2)[:4000])
+                print("\nExtraido ->", json.dumps(extraer(io), ensure_ascii=False, indent=2))
+                print("\nDEBUG: corto aca (no escribo archivos).", file=sys.stderr)
+                return
 
             if not objetos:
                 break
@@ -201,7 +227,8 @@ def main():
     if not filas:
         sys.exit("No se encontraron items con esos filtros.")
 
-    cols = ["workflowitem_id", "item_uuid", "titulo", "link_workflow", "link_item"]
+    cols = ["tarea_id", "workflowitem_id", "item_uuid", "titulo",
+            "link_workflow", "link_item"]
     with open(OUT_CSV, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=cols)
         w.writeheader()
