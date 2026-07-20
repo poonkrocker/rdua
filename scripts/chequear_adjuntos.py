@@ -2,33 +2,42 @@
 Chequeo liviano de adjuntos rotos en RDU.
 
 A diferencia de main.py (que abre cada ítem con Playwright, llama a una IA y
-necesita login), este script SOLO lee la API pública de DSpace — sin
-credenciales, sin navegador, sin dependencias externas (pura librería
-estándar de Python) — para detectar adjuntos vacíos o ausentes. Nunca escribe
-ni modifica nada en RDU: el resultado es un reporte en CSV
-(reportes/adjuntos_rotos.csv) para revisar a mano.
+necesita login para EDITAR), este script solo LEE — nunca escribe ni modifica
+nada en RDU. El resultado es un reporte en CSV (reportes/adjuntos_rotos.csv)
+para revisar a mano, marcado con [ADJUNTO NO FUNCIONA].
 
-Dos chequeos:
-  1. RÁPIDO (siempre completo, cada corrida): ítems sin NINGÚN archivo en el
-     bundle ORIGINAL. Usa el filtro nativo de DSpace
-     `has_content_in_original_bundle=false`, así que es una sola consulta
-     liviana sin importar el tamaño del repositorio.
-  2. GRADUAL (avanza de a tramos, con checkpoint): recorre TODO el
-     repositorio buscando ítems que sí tienen archivo pero pesa
-     UMBRAL_BYTES_VACIO bytes o menos (los vacíos observados en RDU pesan 42
-     bytes). Pedirle a la API los bitstreams de cada ítem es lento en el
-     servidor (varios segundos cada 20 ítems), así que recorrer los ~35000
-     ítems del repositorio de una sola corrida tardaría horas. Por eso cada
-     corrida procesa hasta MAX_PAGINAS_POR_CORRIDA páginas y guarda dónde
-     quedó en reportes/checkpoint_adjuntos.txt; la corrida siguiente retoma
-     ahí. Al llegar al final vuelve a arrancar desde el principio, así que
-     con un cron cada pocas horas el repositorio entero queda re-chequeado
-     cada uno o dos días, en bucle continuo.
+Tres chequeos, todos filtrables por tipo de ítem y rango de años (variables
+TIPOS / ANIO_DESDE / ANIO_HASTA):
+  1. RÁPIDO (siempre completo, cada corrida): ítems PÚBLICOS sin NINGÚN
+     archivo en el bundle ORIGINAL. Usa el filtro nativo de DSpace
+     `has_content_in_original_bundle=false`, así que es liviano sin importar
+     el tamaño del repositorio. No requiere login.
+  2. GRADUAL (avanza de a tramos, con checkpoint): recorre los ítems
+     PÚBLICOS que sí tienen archivo pero pesa UMBRAL_BYTES_VACIO bytes o
+     menos (los vacíos observados en RDU pesan 42 bytes). Pedirle a la API
+     los bitstreams de cada ítem es lento del lado del servidor, así que
+     recorrer TODO el repositorio de una sola corrida sería demasiado lento.
+     Por eso cada corrida procesa hasta MAX_PAGINAS_POR_CORRIDA páginas y
+     guarda dónde quedó en reportes/checkpoint_adjuntos.txt; la corrida
+     siguiente retoma ahí, y al llegar al final vuelve a arrancar. No
+     requiere login (usa la búsqueda pública).
+  3. WORKFLOW (opcional, solo si hay RDU_USER/RDU_PASS configurados): ítems
+     que TODAVÍA NO son públicos porque están en el circuito de revisión de
+     DSpace (enviados, en aprobación) — esos no aparecen en la búsqueda
+     anónima, así que hace falta autenticarse contra la API con las mismas
+     credenciales que ya usa main.py. Este chequeo es best-effort: si algo
+     falla (credenciales ausentes, permisos insuficientes, forma de
+     respuesta inesperada), lo avisa por log y NO hace fallar el resto del
+     script — los chequeos 1 y 2 se guardan igual.
 """
 import csv
+import http.cookiejar
 import json
 import os
+import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import date
 
@@ -39,6 +48,15 @@ TAMANO_PAGINA = int(os.environ.get("TAMANO_PAGINA", "20"))
 MAX_PAGINAS_POR_CORRIDA = int(os.environ.get("MAX_PAGINAS_POR_CORRIDA", "150"))
 UMBRAL_BYTES_VACIO = int(os.environ.get("UMBRAL_BYTES_VACIO", "42"))
 PAUSA_SEGUNDOS = float(os.environ.get("PAUSA_SEGUNDOS", "0.3"))  # para no saturar el servidor
+REINTENTOS = int(os.environ.get("REINTENTOS", "3"))
+
+# Filtros opcionales. TIPOS: valores de dc.type separados por coma (ej.
+# "doctoralThesis,masterThesis"), vacío = todos. ANIO_DESDE/ANIO_HASTA:
+# años de dc.date.issued, cualquiera de los dos puede quedar vacío para
+# dejar el rango abierto de ese lado.
+TIPOS = [t.strip() for t in os.environ.get("TIPOS", "").split(",") if t.strip()]
+ANIO_DESDE = os.environ.get("ANIO_DESDE", "").strip()
+ANIO_HASTA = os.environ.get("ANIO_HASTA", "").strip()
 
 DIR_REPORTES = "reportes"
 ARCHIVO_CHECKPOINT = os.path.join(DIR_REPORTES, "checkpoint_adjuntos.txt")
@@ -49,10 +67,28 @@ CAMPOS_REPORTE = ["handle", "titulo", "tipo", "problema", "bytes", "link", "dete
 MARCA = "[ADJUNTO NO FUNCIONA]"
 
 
-def _get(url: str) -> dict:
+# ---------- HTTP CON REINTENTOS ----------
+def _abrir_con_reintentos(opener, req):
+    ultimo_error = None
+    for intento in range(1, REINTENTOS + 1):
+        try:
+            return opener.open(req, timeout=40)
+        except Exception as e:
+            ultimo_error = e
+            if intento < REINTENTOS:
+                print(f"  [WARN] Falló la petición (intento {intento}/{REINTENTOS}): {e}. Reintentando...")
+                time.sleep(1.5 * intento)
+    raise ultimo_error
+
+
+_OPENER_ANONIMO = urllib.request.build_opener()
+
+
+def _get(url: str, opener=None) -> dict:
+    opener = opener or _OPENER_ANONIMO
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=40) as resp:
-        return json.loads(resp.read())
+    resp = _abrir_con_reintentos(opener, req)
+    return json.loads(resp.read())
 
 
 def _link(handle: str) -> str:
@@ -64,8 +100,47 @@ def _metadata(item: dict, campo: str) -> str:
     return "; ".join(v.get("value", "") for v in valores if v.get("value"))
 
 
+# ---------- FILTRO POR TIPO / AÑO ----------
+def _query_filtro() -> str | None:
+    partes = []
+    if TIPOS:
+        partes.append("itemtype:(" + " OR ".join(TIPOS) + ")")
+    if ANIO_DESDE or ANIO_HASTA:
+        desde = f"{ANIO_DESDE or '1900'}-01-01"
+        hasta = f"{ANIO_HASTA or '2100'}-12-31"
+        partes.append(f"dateIssued:[{desde} TO {hasta}]")
+    return " AND ".join(partes) if partes else None
+
+
+def _url_discover(extra: str, size: int, pagina: int) -> str:
+    url = f"{API}/discover/search/objects?dsoType=item&{extra}&size={size}&page={pagina}"
+    query = _query_filtro()
+    if query:
+        url += f"&query={urllib.parse.quote(query, safe='')}"
+    return url
+
+
+def _item_cumple_filtro(item: dict) -> bool:
+    """Para chequeos que NO pasan por la búsqueda (ej. workflow), aplica el
+    mismo filtro de tipo/año a mano sobre los metadatos del ítem."""
+    if TIPOS:
+        tipo = _metadata(item, "dc.type")
+        if tipo not in TIPOS:
+            return False
+    if ANIO_DESDE or ANIO_HASTA:
+        fecha = _metadata(item, "dc.date.issued")[:4]
+        if not fecha.isdigit():
+            return False
+        anio = int(fecha)
+        if ANIO_DESDE and anio < int(ANIO_DESDE):
+            return False
+        if ANIO_HASTA and anio > int(ANIO_HASTA):
+            return False
+    return True
+
+
+# ---------- REPORTE ----------
 def _leer_reporte() -> dict:
-    """Devuelve {handle: fila} con lo que ya está reportado como roto de corridas anteriores."""
     if not os.path.exists(ARCHIVO_REPORTE):
         return {}
     with open(ARCHIVO_REPORTE, newline="", encoding="utf-8") as f:
@@ -81,15 +156,15 @@ def _guardar_reporte(filas: dict):
             writer.writerow(filas[handle])
 
 
-def _fila_para(item: dict, problema: str, tam: int) -> dict:
-    handle = item.get("handle", "")
+def _fila_para(item: dict, problema: str, tam: int, handle_alternativo: str = "") -> dict:
+    handle = item.get("handle") or handle_alternativo
     return {
         "handle": handle,
         "titulo": item.get("name", ""),
         "tipo": _metadata(item, "dc.type"),
         "problema": f"{MARCA} {problema}",
         "bytes": tam,
-        "link": _link(handle),
+        "link": _link(handle) if handle else "(sin handle: revisar en el panel de RDU)",
         "detectado": date.today().isoformat(),
     }
 
@@ -118,15 +193,13 @@ def _evaluar_bundle_original(item: dict):
     return None
 
 
-# ---------- CHEQUEO RÁPIDO: ítems sin ningún archivo original ----------
+# ---------- CHEQUEO 1: RÁPIDO, ítems públicos sin ningún archivo original ----------
 def chequeo_rapido(filas_reporte: dict):
-    print("[RÁPIDO] Buscando ítems sin ningún archivo en el bundle ORIGINAL...")
+    print("[RÁPIDO] Buscando ítems públicos sin ningún archivo en el bundle ORIGINAL...")
     encontrados_ahora = set()
     pagina = 0
     while True:
-        url = (f"{API}/discover/search/objects?dsoType=item"
-               f"&f.has_content_in_original_bundle=false,equals"
-               f"&size=100&page={pagina}")
+        url = _url_discover("f.has_content_in_original_bundle=false,equals", 100, pagina)
         data = _get(url)
         resultado = data["_embedded"]["searchResult"]
         objetos = resultado["_embedded"].get("objects", [])
@@ -150,7 +223,7 @@ def chequeo_rapido(filas_reporte: dict):
     print(f"[RÁPIDO] {len(encontrados_ahora)} ítem(s) sin ningún archivo adjunto{extra}.")
 
 
-# ---------- CHEQUEO GRADUAL: recorre todo el repositorio buscando adjuntos rotos ----------
+# ---------- CHEQUEO 2: GRADUAL, recorre los ítems públicos buscando adjuntos rotos ----------
 def _leer_checkpoint() -> int:
     if not os.path.exists(ARCHIVO_CHECKPOINT):
         return 0
@@ -176,12 +249,11 @@ def chequeo_gradual(filas_reporte: dict):
     resueltos = 0
 
     while paginas_procesadas < MAX_PAGINAS_POR_CORRIDA:
-        url = (f"{API}/discover/search/objects?dsoType=item"
-               f"&embed=bundles/bitstreams&size={TAMANO_PAGINA}&page={pagina}")
+        url = _url_discover("embed=bundles/bitstreams", TAMANO_PAGINA, pagina)
         try:
             data = _get(url)
         except Exception as e:
-            print(f"  [WARN] Falló la página {pagina}: {e}. Se reintenta en la próxima corrida.")
+            print(f"  [WARN] Falló la página {pagina} tras varios intentos: {e}. Se retoma en la próxima corrida.")
             break
 
         resultado = data["_embedded"]["searchResult"]
@@ -198,14 +270,13 @@ def chequeo_gradual(filas_reporte: dict):
                 rotos_detectados += 1
                 print(f"  {MARCA} {handle} — {problema} ({tam} bytes) — {item.get('name', '')}")
             elif handle in filas_reporte:
-                # Ya no está roto (se corrigió desde el último chequeo de este tramo).
-                del filas_reporte[handle]
+                del filas_reporte[handle]  # ya no está roto (se corrigió desde el último paso por acá)
                 resueltos += 1
 
         paginas_procesadas += 1
         pagina += 1
         if pagina >= total_paginas:
-            print("  [GRADUAL] Se completó una vuelta entera al repositorio. Reiniciando desde el principio.")
+            print("  [GRADUAL] Se completó una vuelta entera al filtro actual. Reiniciando desde el principio.")
             pagina = 0
         time.sleep(PAUSA_SEGUNDOS)
 
@@ -214,16 +285,139 @@ def chequeo_gradual(filas_reporte: dict):
           f"({paginas_procesadas * TAMANO_PAGINA} ítems). "
           f"Rotos detectados: {rotos_detectados}. Resueltos desde la última vez: {resueltos}.")
     if total_paginas:
-        avance = min(100.0, round(pagina / total_paginas * 100, 1))
+        avance = min(100.0, round(pagina / total_paginas * 100, 1)) if total_paginas else 100.0
         print(f"[GRADUAL] Próxima corrida retoma en la página {pagina} de {total_paginas} (~{avance}% del ciclo).")
 
 
+# ---------- CHEQUEO 3: WORKFLOW, ítems todavía no públicos (requiere login) ----------
+def _login_rdu():
+    """Autentica contra la API de RDU. Devuelve un opener de urllib listo para
+    usar en pedidos autenticados, o None si no hay credenciales o el login
+    falló (en cuyo caso el chequeo de workflow simplemente se omite)."""
+    usuario = os.environ.get("RDU_USER")
+    clave = os.environ.get("RDU_PASS")
+    if not usuario or not clave:
+        print("[WORKFLOW] RDU_USER/RDU_PASS no están configurados; se omite el chequeo de ítems en revisión.")
+        return None
+
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
+    # 1) Pedir el token CSRF: viene en el header DSPACE-XSRF-TOKEN y además
+    #    DSpace deja la cookie correspondiente guardada en el cookiejar.
+    req = urllib.request.Request(f"{API}/authn/status", headers={"Accept": "application/json"})
+    resp = _abrir_con_reintentos(opener, req)
+    xsrf = resp.headers.get("DSPACE-XSRF-TOKEN")
+    if not xsrf:
+        print("[WORKFLOW] No se pudo obtener el token CSRF de RDU; se omite el chequeo de ítems en revisión.")
+        return None
+
+    # 2) Login. La cookie CSRF ya está en el cookiejar del opener.
+    body = urllib.parse.urlencode({"user": usuario, "password": clave}).encode()
+    req = urllib.request.Request(
+        f"{API}/authn/login", data=body, method="POST",
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-XSRF-TOKEN": xsrf,
+            "Accept": "application/json",
+        },
+    )
+    try:
+        resp = _abrir_con_reintentos(opener, req)
+    except urllib.error.HTTPError as e:
+        print(f"[WORKFLOW] Login a RDU falló ({e.code}): revisá RDU_USER/RDU_PASS. Se omite este chequeo.")
+        return None
+
+    token = resp.headers.get("Authorization")
+    if not token:
+        print("[WORKFLOW] El login a RDU no devolvió token de autorización; se omite este chequeo.")
+        return None
+
+    opener.addheaders = [("Authorization", token), ("Accept", "application/json")]
+    print("[WORKFLOW] Login a RDU exitoso.")
+    return opener
+
+
+def chequeo_workflow(filas_reporte: dict):
+    """Revisa ítems que todavía están en el circuito de revisión de DSpace
+    (no públicos). Best-effort: cualquier error (incluido el login) se
+    loguea y se sigue de largo sin hacer fallar el resto del script — la
+    forma exacta de esta respuesta no se pudo confirmar contra un ítem real
+    en revisión, así que si falla, avisá el mensaje de [WARN]/[ERROR] para
+    ajustar el endpoint."""
+    print("[WORKFLOW] Buscando ítems en revisión (no públicos) con adjunto roto...")
+    try:
+        opener = _login_rdu()
+        if not opener:
+            return
+
+        encontrados = 0
+        pagina = 0
+        while True:
+            url = (f"{API}/workflow/workflowitems"
+                   f"?embed=item&embed=item/bundles/bitstreams&size=20&page={pagina}")
+            data = _get(url, opener=opener)
+            resultado = data.get("_embedded", {})
+            workflowitems = resultado.get("workflowitems", [])
+
+            for wi in workflowitems:
+                item = wi.get("_embedded", {}).get("item")
+                if not item:
+                    continue
+                if not _item_cumple_filtro(item):
+                    continue
+                handle = item.get("handle") or f"workflow-{wi.get('id', '')}"
+                evaluacion = _evaluar_bundle_original(item)
+                if evaluacion:
+                    problema, tam = evaluacion
+                    filas_reporte[handle] = _fila_para(item, f"{problema} (EN REVISIÓN, no público)", tam, handle)
+                    encontrados += 1
+                    print(f"  {MARCA} {handle} — {problema} (en revisión) — {item.get('name', '')}")
+
+            pagina_info = data.get("page", {})
+            total_paginas = pagina_info.get("totalPages", 1)
+            pagina += 1
+            if pagina >= total_paginas:
+                break
+            time.sleep(PAUSA_SEGUNDOS)
+
+        print(f"[WORKFLOW] {encontrados} ítem(s) en revisión con adjunto roto.")
+    except Exception as e:
+        print(f"[WORKFLOW] [ERROR] No se pudo completar el chequeo de ítems en revisión: {e}. "
+              f"Se ignora y se sigue con el resto (puede que el endpoint o el formato de "
+              f"respuesta necesiten ajuste — revisar scripts/chequear_adjuntos.py::chequeo_workflow).")
+
+
 def main():
+    if TIPOS:
+        print(f"Filtro de tipo activo: {', '.join(TIPOS)}")
+    if ANIO_DESDE or ANIO_HASTA:
+        print(f"Filtro de año activo: {ANIO_DESDE or '(sin mínimo)'} a {ANIO_HASTA or '(sin máximo)'}")
+
     filas_reporte = _leer_reporte()
-    chequeo_rapido(filas_reporte)
-    chequeo_gradual(filas_reporte)
+
+    # Cada chequeo es independiente: si uno falla (ej. la API no responde en
+    # ese momento), los otros dos igual corren y el reporte se guarda con lo
+    # que sí se pudo juntar. Al final, si hubo algún fallo, el script termina
+    # con código de error para que quede visible en Actions — pero SIN perder
+    # el progreso ya guardado.
+    hubo_fallas = False
+    for nombre, chequeo in (
+        ("rápido", chequeo_rapido),
+        ("gradual", chequeo_gradual),
+        ("workflow", chequeo_workflow),
+    ):
+        try:
+            chequeo(filas_reporte)
+        except Exception as e:
+            hubo_fallas = True
+            print(f"[ERROR] El chequeo '{nombre}' falló y se omitió el resto de esa sección: {e}")
+
     _guardar_reporte(filas_reporte)
     print(f"\nReporte actualizado: {ARCHIVO_REPORTE} ({len(filas_reporte)} ítem(s) con adjunto roto).")
+
+    if hubo_fallas:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

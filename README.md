@@ -17,6 +17,25 @@ contra el HTML real de RDU**. Antes de confiar en una corrida desatendida:
    `rdu_navigation.py`.
 3. Recién después de validar con 1-2 items reales, activá el cron.
 
+## ⚠️ Si "Chequear adjuntos rotos RDU" falla con "Process completed with exit code 1"
+
+La causa más común es que al paso final (`git push`, para guardar el reporte
+y el checkpoint) le falta permiso de escritura. Por defecto GitHub le da al
+token de Actions solo permiso de lectura, y hay que habilitarlo a mano una
+vez por repo:
+
+1. En tu repo → **Settings** → **Actions** → **General**.
+2. Bajá hasta **"Workflow permissions"**.
+3. Elegí **"Read and write permissions"** y guardá.
+4. Volvé a correr el workflow (**Actions** → la corrida fallida → **Re-run
+   all jobs**, o disparalo de nuevo manualmente).
+
+Si el que falla es el paso "Ejecutar chequeo de adjuntos" (no el del `git
+push`), fijate en el log qué línea imprimió el error — el script reintenta
+solo los problemas de red pasajeros, así que si igual falla suele ser algo
+puntual (endpoint que cambió, credenciales de `RDU_USER`/`RDU_PASS`
+incorrectas para el chequeo de ítems en revisión, etc.).
+
 ## Setup paso a paso
 
 ### 1. Crear el repo en GitHub
@@ -80,30 +99,59 @@ Está en hora UTC. Argentina es UTC-3, así que `0 9 * * *` = 06:00 hora
 argentina. Para correrlo, por ejemplo, a las 22:00 hora Argentina, sería
 `0 1 * * *` (01:00 UTC del día siguiente).
 
-## Chequeo liviano de adjuntos rotos (sin credenciales)
+## Chequeo liviano de adjuntos rotos
 
 Además del flujo de formateo completo de arriba, `scripts/chequear_adjuntos.py`
 + `.github/workflows/chequear-adjuntos.yml` corren un chequeo mucho más
-simple: recorren la API pública de RDU (sin login, sin Playwright, sin IA,
-sin Google Sheets — solo librería estándar de Python) buscando ítems cuyo
-adjunto está ausente o pesa `UMBRAL_BYTES_VACIO` bytes o menos (los adjuntos
-vacíos observados en RDU pesan 42 bytes). No modifica nada en RDU: solo dejar
-constancia en `reportes/adjuntos_rotos.csv`, con la marca `[ADJUNTO NO
-FUNCIONA]`, el link al ítem y el motivo, para revisar a mano.
+simple: buscan ítems cuyo adjunto está ausente o pesa `UMBRAL_BYTES_VACIO`
+bytes o menos (los adjuntos vacíos observados en RDU pesan 42 bytes). No
+modifica nada en RDU: solo deja constancia en `reportes/adjuntos_rotos.csv`,
+con la marca `[ADJUNTO NO FUNCIONA]`, el link al ítem y el motivo, para
+revisar a mano. El script es liviano (sin Playwright, sin IA, sin Google
+Sheets — solo librería estándar de Python; no hace falta `pip install`).
 
-- **No requiere secrets**: usa solo la API pública, así que no necesita
-  `RDU_USER`/`RDU_PASS` ni ninguna otra credencial.
-- **Corre en tramos**: recorrer los ~35.000 ítems del repositorio pidiéndole
-  a la API el tamaño de cada adjunto es lento del lado del servidor, así que
-  cada corrida avanza `MAX_PAGINAS_POR_CORRIDA` páginas (por defecto 150,
-  ~3000 ítems) y guarda dónde quedó en `reportes/checkpoint_adjuntos.txt`.
-  Con el cron cada 3 horas, el repositorio completo queda re-chequeado cada
-  uno o dos días, en bucle continuo. Los ítems sin ningún adjunto se detectan
-  aparte, en cada corrida, con un filtro nativo de DSpace (rápido, sin
-  recorrer nada).
-- **Se puede correr manualmente**: pestaña **Actions** → "Chequear adjuntos
-  rotos RDU" → **Run workflow**.
-- El reporte y el checkpoint se commitean solos al repo en cada corrida.
+Tres chequeos, todos filtrables por tipo de ítem y años (ver más abajo):
+
+1. **Rápido** (siempre completo, cada corrida): ítems **públicos** sin
+   ningún archivo, vía un filtro nativo de DSpace. No requiere login.
+2. **Gradual** (avanza de a tramos, con checkpoint): recorre los ítems
+   **públicos** comparando el tamaño de cada adjunto contra el umbral.
+   Pedirle a la API el tamaño de cada adjunto es lento del lado del
+   servidor, así que recorrer TODO el repositorio de una sola corrida
+   sería demasiado lento — cada corrida avanza `MAX_PAGINAS_POR_CORRIDA`
+   páginas (por defecto 150, ~3000 ítems) y guarda dónde quedó en
+   `reportes/checkpoint_adjuntos.txt`; la corrida siguiente retoma ahí, y
+   al completar una vuelta arranca de nuevo. Con el cron cada 3 horas, el
+   repositorio completo (dentro del filtro configurado) queda re-chequeado
+   cada uno o dos días, en bucle continuo.
+3. **Workflow** (opcional): ítems que **todavía no son públicos** porque
+   están en el circuito de revisión de DSpace (enviados, en aprobación).
+   Esos no aparecen en la búsqueda anónima, así que este chequeo se
+   autentica contra la API con `RDU_USER`/`RDU_PASS` (los mismos secrets que
+   ya usa "Procesar items RDU"; si no están cargados en este workflow, el
+   chequeo se omite solo, sin marcar error). Es *best-effort*: la forma
+   exacta de la respuesta de RDU para ítems en revisión no se pudo probar
+   contra un ítem real, así que si falla vas a ver un `[WARN]`/`[ERROR]` en
+   el log de esa sección puntual — el resto del chequeo (1 y 2) igual se
+   guarda. Si falla, pasame el mensaje del log para ajustar el endpoint.
+
+### Filtrar por tipo y año
+
+Al correrlo manualmente (pestaña **Actions** → "Chequear adjuntos rotos RDU"
+→ **Run workflow**) aparecen 4 campos:
+
+| Campo | Ejemplo | Vacío significa |
+|---|---|---|
+| `tipos` | `doctoralThesis,masterThesis` | todos los tipos |
+| `anio_desde` | `2020` | sin mínimo |
+| `anio_hasta` | `2023` | sin máximo |
+| `max_paginas` | `150` | usa el valor por defecto |
+
+Los valores válidos de `tipos` son los de `dc.type` en RDU (ej.
+`conferenceObject`, `bachelorThesis`, `dataSet`, `article`, `bookPart`,
+`doctoralThesis`, `masterThesis`, `book`, `workingPaper`, `other`). La
+corrida automática por cron usa los valores por defecto (sin filtro, o los
+que dejes seteados como `default` en el workflow).
 
 ## Límites a tener en cuenta
 
