@@ -28,9 +28,9 @@ jobs:
         env:
           RDU_UI_URL: ${{ github.event.inputs.ui_url }}
           RDU_DEBUG: ${{ github.event.inputs.debug }}
-          RDU_EMAIL: ${{ secrets.RDU_EMAIL }}
-          RDU_PASSWORD: ${{ secrets.RDU_PASSWORD }}
-        run: python scrape_workflow_links.py
+          RDU_EMAIL: ${{ secrets.RDU_USER }}
+          RDU_PASSWORD: ${{ secrets.RDU_PASS }}
+        run: python scripts/scrape_workflow_links.py
 
       - uses: actions/upload-artifact@v4
         if: always()
