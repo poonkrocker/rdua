@@ -1,0 +1,45 @@
+name: Chequear adjuntos rotos RDU
+
+on:
+  schedule:
+    # Cada 3 horas. El chequeo "gradual" avanza de a tramos (ver
+    # scripts/chequear_adjuntos.py), así que con esta frecuencia el
+    # repositorio completo queda re-revisado cada uno o dos días.
+    - cron: "0 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      max_paginas:
+        description: "Páginas a procesar en esta corrida (chequeo gradual, tamaño de página 20)"
+        required: false
+        default: "150"
+
+permissions:
+  contents: write  # necesario para commitear el reporte y el checkpoint actualizados
+
+jobs:
+  chequear:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Clonar repo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Ejecutar chequeo de adjuntos
+        # Sin pip install: el script solo usa librería estándar de Python
+        # (no necesita Playwright, IA ni Google Sheets).
+        env:
+          MAX_PAGINAS_POR_CORRIDA: ${{ github.event.inputs.max_paginas || '150' }}
+        run: python scripts/chequear_adjuntos.py
+
+      - name: Guardar reporte y checkpoint actualizados
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add reportes/
+          git diff --cached --quiet || git commit -m "Actualiza chequeo de adjuntos rotos"
+          git push

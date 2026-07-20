@@ -1,0 +1,45 @@
+name: Aplicar filiación estándar
+
+on:
+  workflow_dispatch: {}  # se corre a mano cuando quieras aplicar el lote
+
+jobs:
+  aplicar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Clonar repo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Ejecutar aplicador de filiación estándar
+        env:
+          MODO_PRUEBA: "false"   # "true" = NO guarda (revisar capturas primero). "false" = guarda de verdad.
+          RDU_USER: ${{ secrets.RDU_USER }}
+          RDU_PASS: ${{ secrets.RDU_PASS }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          MAX_ITEMS_POR_CORRIDA: "10"
+          # Personalizá estos 3 si algún lote es de otra unidad/institución:
+          FIL_UNIDAD_ACADEMICA: "Facultad de Psicología"
+          FIL_INSTITUCION: "Universidad Nacional de Córdoba"
+          FIL_PAIS: "Argentina"
+        run: python scripts/aplicar_filiacion_estandar.py
+
+      - name: Subir capturas como artefacto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capturas-fil-estandar
+          path: capturas/
+          if-no-files-found: ignore
+          retention-days: 7

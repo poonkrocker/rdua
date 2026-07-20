@@ -1,0 +1,33 @@
+name: Scrapear filiaciones existentes
+
+on:
+  workflow_dispatch: {}  # se corre a mano desde la pestaña Actions cuando quieras
+  # Sin cron: este es un proceso que vos disparás cuando querés engordar el
+  # diccionario, no algo que necesite correr todos los días.
+
+jobs:
+  scrapear:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Clonar repo
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Ejecutar scraper de filiaciones
+        env:
+          RDU_USER: ${{ secrets.RDU_USER }}
+          RDU_PASS: ${{ secrets.RDU_PASS }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          MAX_ITEMS_POR_CORRIDA: "20"   # este proceso es liviano (solo lee), podés poner más por corrida
+        run: python scripts/scrape_filiaciones.py
