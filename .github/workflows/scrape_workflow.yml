@@ -1,0 +1,41 @@
+name: Scrapear links de workflow RDU
+
+on:
+  workflow_dispatch:
+    inputs:
+      ui_url:
+        description: "Pega la URL del mydspace con los filtros (spc.page se ignora)"
+        required: true
+        default: "https://rdu.unc.edu.ar/mydspace?configuration=workflow&f.itemtype=conferenceObject,equals&spc.page=1&f.dateIssued.min=2014&f.dateIssued.max=2014"
+      debug:
+        description: "1 = volcar el primer objeto y cortar (para verificar)"
+        required: false
+        default: "0"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install httpx
+
+      - name: Correr el scraper
+        env:
+          RDU_UI_URL: ${{ github.event.inputs.ui_url }}
+          RDU_DEBUG: ${{ github.event.inputs.debug }}
+          RDU_EMAIL: ${{ secrets.RDU_EMAIL }}
+          RDU_PASSWORD: ${{ secrets.RDU_PASSWORD }}
+        run: python scrape_workflow_links.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: workflow-links
+          path: |
+            workflow_links.csv
+            workflow_links.txt
