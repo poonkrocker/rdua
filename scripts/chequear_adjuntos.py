@@ -9,20 +9,26 @@ filtrar por tipo/año contra el buscador. Por cada fila, deja el resultado
 mismo archivo. No modifica nada en RDU: es de solo lectura.
 
 La columna "Link" acepta cualquier forma en la que lo hayas copiado:
-  - link completo con handle:  https://rdu.unc.edu.ar/handle/11086/29993
-  - link completo con uuid:    https://rdu.unc.edu.ar/items/<uuid>
-  - el handle pelado:          11086/29993
+  - link completo con handle:      https://rdu.unc.edu.ar/handle/11086/29993
+  - link completo con uuid:        https://rdu.unc.edu.ar/items/<uuid>
+  - el handle pelado:              11086/29993
   - el uuid pelado
+  - link de edición de un ítem TODAVÍA EN REVISIÓN (no público):
+    https://rdu.unc.edu.ar/workflowitems/<id>/edit — este caso necesita
+    RDU_USER/RDU_PASS configurados (los mismos secrets de "Procesar items
+    RDU"), porque un ítem en revisión no es visible sin login.
 
 Si el archivo de entradas no existe todavía, el script lo crea vacío (con
 los encabezados) y termina — pegá los links y volvé a correrlo.
 
-Además, opcionalmente (solo si hay RDU_USER/RDU_PASS configurados como
-secrets), chequea los ítems que están en el circuito de revisión de DSpace
-(todavía no públicos, por eso no tienen un link "normal" para poner en el
-Excel) y deja el resultado en reportes/adjuntos_rotos_en_revision.csv. Es
-best-effort: si falla algo ahí (permisos, endpoint), se avisa por log sin
-afectar el chequeo del Excel.
+Además, aparte del Excel, si hay RDU_USER/RDU_PASS configurados, el script
+también intenta listar TODOS los ítems en revisión (sin que hayas pegado
+sus links a mano) y deja ese resultado en
+reportes/adjuntos_rotos_en_revision.csv. Es best-effort: en la práctica esa
+lista completa puede devolver 403 si la cuenta no tiene rol de admin —  en
+ese caso, revisar por link individual (arriba) suele funcionar igual porque
+es un permiso distinto. Cualquier falla ahí se avisa por log sin afectar el
+chequeo del Excel.
 """
 import csv
 import http.cookiejar
@@ -75,6 +81,15 @@ def _abrir_con_reintentos(opener, req):
     for intento in range(1, REINTENTOS + 1):
         try:
             return opener.open(req, timeout=40)
+        except urllib.error.HTTPError as e:
+            # Los 4xx (403 sin permiso, 404 no existe, etc.) no son
+            # problemas de red pasajeros: reintentar no los va a arreglar.
+            if 400 <= e.code < 500:
+                raise
+            ultimo_error = e
+            if intento < REINTENTOS:
+                print(f"  [WARN] Falló la petición (intento {intento}/{REINTENTOS}): {e}. Reintentando...")
+                time.sleep(1.5 * intento)
         except Exception as e:
             ultimo_error = e
             if intento < REINTENTOS:
@@ -125,13 +140,21 @@ def _evaluar_bundle_original(item: dict):
 
 # ---------- RESOLVER UN LINK/HANDLE/UUID PEGADO A MANO A UN ÍTEM DE RDU ----------
 def _extraer_identificador(texto: str):
-    """A partir de lo que se pegó en la columna Link, devuelve ("uuid", valor)
-    o ("handle", valor). Acepta link completo (con /items/<uuid> o
-    /handle/<prefijo>/<sufijo>), o el uuid/handle pelado. None si no se
-    pudo interpretar nada."""
+    """A partir de lo que se pegó en la columna Link, devuelve ("uuid", valor),
+    ("handle", valor) o ("workflowitem", id). Acepta link completo (con
+    /items/<uuid>, /handle/<prefijo>/<sufijo> o /workflowitems/<id>/edit —
+    este último es un ítem TODAVÍA EN REVISIÓN, no público), o el uuid/handle
+    pelados. None si no se pudo interpretar nada."""
     texto = (texto or "").strip()
     if not texto:
         return None
+
+    # Ítem en revisión (no público): el link de edición usa el ID interno
+    # del workflowitem, NO el uuid del ítem — hace falta resolverlo vía la
+    # API autenticada (ver _resolver_workflowitem).
+    m = re.search(r"/workflowitems/(\d+)", texto)
+    if m:
+        return ("workflowitem", m.group(1))
 
     m = re.search(r"/handle/(\d+/\d+)", texto)
     if m:
@@ -160,6 +183,21 @@ def _resolver_item(tipo: str, valor: str) -> dict | None:
     else:
         uuid = valor
     return _get(f"{API}/core/items/{uuid}?embed=bundles/bitstreams")
+
+
+def _resolver_workflowitem(workflowitem_id: str, opener) -> dict | None:
+    """Resuelve un ítem TODAVÍA EN REVISIÓN a partir del id de su
+    workflowitem (el que aparece en el link .../workflowitems/<id>/edit).
+    Requiere una sesión autenticada (ver _login_rdu) — a diferencia de
+    listar TODOS los workflowitems (que devolvió 403, probablemente por
+    requerir un rol de admin), pedir uno puntual por id debería andar con
+    cualquier cuenta que tenga la tarea asignada. No confirmado contra un
+    caso real; si también da 403, avisá para ajustar el enfoque."""
+    data = _get(
+        f"{API}/workflow/workflowitems/{workflowitem_id}?embed=item&embed=item/bundles/bitstreams",
+        opener=opener,
+    )
+    return data.get("_embedded", {}).get("item")
 
 
 # ---------- CHEQUEO PRINCIPAL: LOS ÍTEMS QUE PUSISTE EN EL EXCEL ----------
@@ -211,6 +249,11 @@ def chequeo_desde_excel():
     ok = 0
     errores = 0
 
+    # Login lazy: solo se intenta si aparece algún link de workflowitem (ítem
+    # todavía en revisión, no público). None = todavía no se intentó,
+    # False = se intentó y falló (no reintentar de nuevo por cada fila).
+    opener_autenticado = None
+
     for fila in range(2, ws.max_row + 1):
         link = str(ws.cell(row=fila, column=indices["Link"]).value or "").strip()
         if not link:
@@ -224,8 +267,23 @@ def chequeo_desde_excel():
             print(f"  [ERROR] Fila {fila}: no se pudo interpretar '{link}'")
             continue
 
+        tipo, valor = identificador
         try:
-            item = _resolver_item(*identificador)
+            if tipo == "workflowitem":
+                if opener_autenticado is None:
+                    opener_autenticado = _login_rdu() or False
+                if not opener_autenticado:
+                    _escribir_resultado_fila(
+                        ws, indices, fila, "ERROR",
+                        "Es un ítem en revisión (workflowitem): hace falta RDU_USER/RDU_PASS "
+                        "configurados y con permiso para verlo", "",
+                    )
+                    errores += 1
+                    print(f"  [ERROR] Fila {fila}: '{link}' es un ítem en revisión y no hay sesión válida.")
+                    continue
+                item = _resolver_workflowitem(valor, opener_autenticado)
+            else:
+                item = _resolver_item(tipo, valor)
         except Exception as e:
             _escribir_resultado_fila(ws, indices, fila, "ERROR", f"Falló la consulta a RDU: {e}", "")
             errores += 1

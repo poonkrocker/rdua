@@ -116,6 +116,11 @@ nada en RDU: es de solo lectura.
    - `https://rdu.unc.edu.ar/handle/11086/29993`
    - `https://rdu.unc.edu.ar/items/<uuid>`
    - `11086/29993` (el handle pelado)
+   - `https://rdu.unc.edu.ar/workflowitems/<id>/edit` — el link de edición de
+     un ítem **todavía en revisión** (no público). Para este caso hacen
+     falta `RDU_USER`/`RDU_PASS` configurados como secrets (los mismos que
+     ya usa "Procesar items RDU"), porque un ítem en revisión no es visible
+     sin iniciar sesión.
 3. Subí el Excel al repo (commit + push) y corré el workflow (pestaña
    **Actions** → "Chequear adjuntos rotos RDU" → **Run workflow**, o esperá
    al cron diario).
@@ -128,16 +133,23 @@ Un adjunto se marca `[ADJUNTO NO FUNCIONA]` si no tiene ningún archivo, o si
 pesa `UMBRAL_BYTES_VACIO` bytes o menos (los adjuntos vacíos observados en
 RDU pesan 42 bytes).
 
-### Ítems en revisión (opcional, requiere login)
+### Ítems en revisión (todavía no públicos, requiere login)
 
-Aparte del Excel, si hay `RDU_USER`/`RDU_PASS` configurados como secrets
-(los mismos que ya usa "Procesar items RDU"), el script también revisa los
-ítems que **todavía no son públicos** porque están en el circuito de
-revisión de DSpace — esos no tienen un link "normal" para pegar en el
-Excel, por eso van aparte, en `reportes/adjuntos_rotos_en_revision.csv`. Es
-*best-effort*: si tu cuenta no tiene permisos de revisor/admin en RDU (vas
-a ver un `403` en el log) o si la forma de la respuesta necesita un ajuste,
-avisa por log sin afectar el chequeo del Excel.
+Hay dos maneras de chequear ítems que están en el circuito de revisión de
+DSpace (enviados, en aprobación — no aparecen en la búsqueda pública):
+
+1. **Por link individual en el Excel** (recomendado si ya tenés los links,
+   ej. copiados de tu bandeja de revisión en RDU): pegá el link
+   `.../workflowitems/<id>/edit` en la columna Link como cualquier otro. El
+   script pide ESE ítem puntual con tu sesión autenticada — este permiso
+   suele estar disponible para cualquier cuenta con la tarea asignada.
+2. **Listado automático** (sin pegar nada a mano): aparte del Excel, si hay
+   `RDU_USER`/`RDU_PASS` configurados, el script también intenta traer TODA
+   la cola de revisión y la deja en
+   `reportes/adjuntos_rotos_en_revision.csv`. Esto requiere un permiso más
+   amplio (parece necesitar rol de admin) — si tu cuenta no lo tiene vas a
+   ver un `403` en el log para esta parte puntual, sin que afecte el
+   chequeo del Excel. Si te da 403 acá, usá la opción 1.
 
 ## Límites a tener en cuenta
 
