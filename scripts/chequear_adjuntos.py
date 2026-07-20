@@ -66,6 +66,18 @@ CAMPOS_REPORTE = ["handle", "titulo", "tipo", "problema", "bytes", "link", "dete
 
 MARCA = "[ADJUNTO NO FUNCIONA]"
 
+# Algunos WAF/firewalls institucionales cortan la conexión sin responder
+# (síntoma: "Remote end closed connection without response") cuando ven el
+# user-agent por defecto de Python ("Python-urllib/3.x"), porque lo
+# reconocen como firma de bot. Mandamos cabeceras de navegador real para
+# evitarlo.
+CABECERAS_BASE = {
+    "Accept": "application/json",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Accept-Language": "es-AR,es;q=0.9,en;q=0.8",
+}
+
 
 # ---------- HTTP CON REINTENTOS ----------
 def _abrir_con_reintentos(opener, req):
@@ -86,7 +98,7 @@ _OPENER_ANONIMO = urllib.request.build_opener()
 
 def _get(url: str, opener=None) -> dict:
     opener = opener or _OPENER_ANONIMO
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    req = urllib.request.Request(url, headers=CABECERAS_BASE)
     resp = _abrir_con_reintentos(opener, req)
     return json.loads(resp.read())
 
@@ -305,7 +317,7 @@ def _login_rdu():
 
     # 1) Pedir el token CSRF: viene en el header DSPACE-XSRF-TOKEN y además
     #    DSpace deja la cookie correspondiente guardada en el cookiejar.
-    req = urllib.request.Request(f"{API}/authn/status", headers={"Accept": "application/json"})
+    req = urllib.request.Request(f"{API}/authn/status", headers=CABECERAS_BASE)
     resp = _abrir_con_reintentos(opener, req)
     xsrf = resp.headers.get("DSPACE-XSRF-TOKEN")
     if not xsrf:
@@ -317,9 +329,9 @@ def _login_rdu():
     req = urllib.request.Request(
         f"{API}/authn/login", data=body, method="POST",
         headers={
+            **CABECERAS_BASE,
             "Content-Type": "application/x-www-form-urlencoded",
             "X-XSRF-TOKEN": xsrf,
-            "Accept": "application/json",
         },
     )
     try:
@@ -333,7 +345,7 @@ def _login_rdu():
         print("[WORKFLOW] El login a RDU no devolvió token de autorización; se omite este chequeo.")
         return None
 
-    opener.addheaders = [("Authorization", token), ("Accept", "application/json")]
+    opener.addheaders = [("Authorization", token)] + list(CABECERAS_BASE.items())
     print("[WORKFLOW] Login a RDU exitoso.")
     return opener
 
