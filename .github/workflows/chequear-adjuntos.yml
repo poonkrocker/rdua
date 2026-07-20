@@ -42,6 +42,21 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: "DIAGNÓSTICO temporal: probar la API con curl desde este runner"
+        continue-on-error: true
+        run: |
+          echo "===== IP pública de este runner ====="
+          curl -s https://api.ipify.org || true
+          echo ""
+          echo ""
+          echo "===== curl -v a la API pública (huella TLS/HTTP distinta a Python) ====="
+          curl -sv "https://rdu.unc.edu.ar/server/api/discover/search/objects?dsoType=item&size=1" -o /tmp/curl_out.json 2>&1 | tail -60
+          echo "----- bytes recibidos en el body: -----"
+          wc -c /tmp/curl_out.json || true
+          echo ""
+          echo "===== curl a la home pública (sin /server/api) ====="
+          curl -s -o /dev/null -w "status=%{http_code}\n" "https://rdu.unc.edu.ar/" || true
+
       - name: Ejecutar chequeo de adjuntos
         # Sin pip install: el script solo usa librería estándar de Python
         # (no necesita Playwright ni IA). RDU_USER/RDU_PASS son los mismos
