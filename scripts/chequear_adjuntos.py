@@ -118,8 +118,14 @@ def _query_filtro() -> str | None:
     if TIPOS:
         partes.append("itemtype:(" + " OR ".join(TIPOS) + ")")
     if ANIO_DESDE or ANIO_HASTA:
-        desde = f"{ANIO_DESDE or '1900'}-01-01"
-        hasta = f"{ANIO_HASTA or '2100'}-12-31"
+        # OJO: el rango va con años pelados ("[2014 TO 2014]"), NO con fechas
+        # completas ("2014-01-01"). RDU indexa la mayoría de los ítems solo
+        # con el año, y un rango con fecha completa no matchea esos valores
+        # (probado contra la API real: [2014-01-01 TO 2014-12-31] da 0
+        # resultados, [2014 TO 2014] da el conteo correcto). "*" deja ese
+        # extremo del rango abierto.
+        desde = ANIO_DESDE or "*"
+        hasta = ANIO_HASTA or "*"
         partes.append(f"dateIssued:[{desde} TO {hasta}]")
     return " AND ".join(partes) if partes else None
 
@@ -270,6 +276,10 @@ def chequeo_gradual(filas_reporte: dict):
 
         resultado = data["_embedded"]["searchResult"]
         total_paginas = resultado["page"]["totalPages"]
+        if total_paginas == 0:
+            print("  [GRADUAL] El filtro de tipo/año actual no matchea ningún ítem público. Nada para revisar.")
+            pagina = 0
+            break
         objetos = resultado["_embedded"].get("objects", [])
 
         for obj in objetos:
@@ -288,8 +298,9 @@ def chequeo_gradual(filas_reporte: dict):
         paginas_procesadas += 1
         pagina += 1
         if pagina >= total_paginas:
-            print("  [GRADUAL] Se completó una vuelta entera al filtro actual. Reiniciando desde el principio.")
+            print("  [GRADUAL] Se completó una vuelta entera al filtro actual en esta corrida.")
             pagina = 0
+            break  # no tiene sentido volver a recorrer el mismo filtro de nuevo en la misma corrida
         time.sleep(PAUSA_SEGUNDOS)
 
     _guardar_checkpoint(pagina)
