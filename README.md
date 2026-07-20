@@ -99,59 +99,45 @@ Está en hora UTC. Argentina es UTC-3, así que `0 9 * * *` = 06:00 hora
 argentina. Para correrlo, por ejemplo, a las 22:00 hora Argentina, sería
 `0 1 * * *` (01:00 UTC del día siguiente).
 
-## Chequeo liviano de adjuntos rotos
+## Chequeo de adjuntos rotos a partir de un Excel
 
 Además del flujo de formateo completo de arriba, `scripts/chequear_adjuntos.py`
 + `.github/workflows/chequear-adjuntos.yml` corren un chequeo mucho más
-simple: buscan ítems cuyo adjunto está ausente o pesa `UMBRAL_BYTES_VACIO`
-bytes o menos (los adjuntos vacíos observados en RDU pesan 42 bytes). No
-modifica nada en RDU: solo deja constancia en `reportes/adjuntos_rotos.csv`,
-con la marca `[ADJUNTO NO FUNCIONA]`, el link al ítem y el motivo, para
-revisar a mano. El script es liviano (sin Playwright, sin IA, sin Google
-Sheets — solo librería estándar de Python; no hace falta `pip install`).
+simple, cuyo universo de ítems a revisar **lo definís vos a mano en un
+Excel** — no filtra ni recorre el repositorio por su cuenta. No modifica
+nada en RDU: es de solo lectura.
 
-Tres chequeos, todos filtrables por tipo de ítem y años (ver más abajo):
+### Cómo se usa
 
-1. **Rápido** (siempre completo, cada corrida): ítems **públicos** sin
-   ningún archivo, vía un filtro nativo de DSpace. No requiere login.
-2. **Gradual** (avanza de a tramos, con checkpoint): recorre los ítems
-   **públicos** comparando el tamaño de cada adjunto contra el umbral.
-   Pedirle a la API el tamaño de cada adjunto es lento del lado del
-   servidor, así que recorrer TODO el repositorio de una sola corrida
-   sería demasiado lento — cada corrida avanza `MAX_PAGINAS_POR_CORRIDA`
-   páginas (por defecto 150, ~3000 ítems) y guarda dónde quedó en
-   `reportes/checkpoint_adjuntos.txt`; la corrida siguiente retoma ahí, y
-   al completar una vuelta arranca de nuevo. Con el cron cada 3 horas, el
-   repositorio completo (dentro del filtro configurado) queda re-chequeado
-   cada uno o dos días, en bucle continuo.
-3. **Workflow** (opcional): ítems que **todavía no son públicos** porque
-   están en el circuito de revisión de DSpace (enviados, en aprobación).
-   Esos no aparecen en la búsqueda anónima, así que este chequeo se
-   autentica contra la API con `RDU_USER`/`RDU_PASS` (los mismos secrets que
-   ya usa "Procesar items RDU"; si no están cargados en este workflow, el
-   chequeo se omite solo, sin marcar error). Es *best-effort*: la forma
-   exacta de la respuesta de RDU para ítems en revisión no se pudo probar
-   contra un ítem real, así que si falla vas a ver un `[WARN]`/`[ERROR]` en
-   el log de esa sección puntual — el resto del chequeo (1 y 2) igual se
-   guarda. Si falla, pasame el mensaje del log para ajustar el endpoint.
+1. Abrí (o creá corriendo el workflow una vez) `reportes/entradas_a_revisar.xlsx`.
+2. En la columna **Link** pegá, uno por fila, el link o handle de cada ítem
+   que querés chequear — cualquiera de estas formas sirve tal cual la
+   copiaste:
+   - `https://rdu.unc.edu.ar/handle/11086/29993`
+   - `https://rdu.unc.edu.ar/items/<uuid>`
+   - `11086/29993` (el handle pelado)
+3. Subí el Excel al repo (commit + push) y corré el workflow (pestaña
+   **Actions** → "Chequear adjuntos rotos RDU" → **Run workflow**, o esperá
+   al cron diario).
+4. El script completa, en la misma fila, las columnas **Titulo**, **Estado**
+   (`OK` o `[ADJUNTO NO FUNCIONA]`), **Detalle** (motivo), **Bytes** (tamaño
+   del adjunto encontrado) y **ÚltimoChequeo** (fecha), y commitea el Excel
+   actualizado de vuelta al repo.
 
-### Filtrar por tipo y año
+Un adjunto se marca `[ADJUNTO NO FUNCIONA]` si no tiene ningún archivo, o si
+pesa `UMBRAL_BYTES_VACIO` bytes o menos (los adjuntos vacíos observados en
+RDU pesan 42 bytes).
 
-Al correrlo manualmente (pestaña **Actions** → "Chequear adjuntos rotos RDU"
-→ **Run workflow**) aparecen 4 campos:
+### Ítems en revisión (opcional, requiere login)
 
-| Campo | Ejemplo | Vacío significa |
-|---|---|---|
-| `tipos` | `doctoralThesis,masterThesis` | todos los tipos |
-| `anio_desde` | `2020` | sin mínimo |
-| `anio_hasta` | `2023` | sin máximo |
-| `max_paginas` | `150` | usa el valor por defecto |
-
-Los valores válidos de `tipos` son los de `dc.type` en RDU (ej.
-`conferenceObject`, `bachelorThesis`, `dataSet`, `article`, `bookPart`,
-`doctoralThesis`, `masterThesis`, `book`, `workingPaper`, `other`). La
-corrida automática por cron usa los valores por defecto (sin filtro, o los
-que dejes seteados como `default` en el workflow).
+Aparte del Excel, si hay `RDU_USER`/`RDU_PASS` configurados como secrets
+(los mismos que ya usa "Procesar items RDU"), el script también revisa los
+ítems que **todavía no son públicos** porque están en el circuito de
+revisión de DSpace — esos no tienen un link "normal" para pegar en el
+Excel, por eso van aparte, en `reportes/adjuntos_rotos_en_revision.csv`. Es
+*best-effort*: si tu cuenta no tiene permisos de revisor/admin en RDU (vas
+a ver un `403` en el log) o si la forma de la respuesta necesita un ajuste,
+avisa por log sin afectar el chequeo del Excel.
 
 ## Límites a tener en cuenta
 
