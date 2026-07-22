@@ -16,7 +16,7 @@ Variables de entorno:
   RDU_PASSWORD contrasena de RDU
   RDU_DEBUG=1  vuelca el JSON del primer objeto y corta (para verificar estructura)
 
-Salida: workflow_links.csv  (+ workflow_links.txt con una URL por linea)
+Salida: workflow_links.csv  (encabezado: Link,Titulo)
 """
 
 import csv
@@ -45,7 +45,6 @@ DEBUG = os.environ.get("RDU_DEBUG", "") == "1"
 PAGE_SIZE = 100
 TIMEOUT = 60
 OUT_CSV = "workflow_links.csv"
-OUT_TXT = "workflow_links.txt"
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -227,18 +226,13 @@ def main():
     if not filas:
         sys.exit("No se encontraron items con esos filtros.")
 
-    cols = ["tarea_id", "workflowitem_id", "item_uuid", "titulo",
-            "link_workflow", "link_item"]
-    with open(OUT_CSV, "w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=cols)
-        w.writeheader()
-        w.writerows(filas)
-
-    with open(OUT_TXT, "w", encoding="utf-8") as fh:
+    with open(OUT_CSV, "w", newline="", encoding="utf-8-sig") as fh:
+        w = csv.writer(fh)
+        w.writerow(["Link", "Titulo"])
         for f in filas:
-            fh.write((f["link_workflow"] or f["link_item"]) + "\n")
+            w.writerow([f["link_workflow"] or f["link_item"], f["titulo"]])
 
-    print(f"\nOK -> {OUT_CSV} y {OUT_TXT}  ({len(filas)} items)")
+    print(f"\nOK -> {OUT_CSV}  ({len(filas)} items)")
 
 
 if __name__ == "__main__":
