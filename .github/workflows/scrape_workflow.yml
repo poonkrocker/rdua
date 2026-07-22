@@ -36,6 +36,4 @@ jobs:
         if: always()
         with:
           name: workflow-links
-          path: |
-            workflow_links.csv
-            workflow_links.txt
+          path: workflow_links.csv
