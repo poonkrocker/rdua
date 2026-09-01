@@ -22,7 +22,6 @@ Salida: workflow_links.csv  (encabezado: Link,Titulo)
 import csv
 import json
 import os
-import re
 import sys
 import time
 from urllib.parse import urlparse, parse_qs
@@ -60,26 +59,22 @@ IGNORAR = {"spc.page", "page", "size", "spc.sf", "spc.sd", "spc.rpp"}
 
 
 def params_desde_url(url):
-    """Traduce los query params de la UI a params de /discover/search/objects."""
+    """Traduce los query params de la UI a params de /discover/search/objects.
+
+    f.campo.min / f.campo.max (ej. f.dateIssued.min/.max) se reenvian TAL
+    CUAL, sueltos — asi los manda la UI de Angular al backend. Antes se
+    combinaban a mano en un rango tipo f.campo=[min TO max],equals, pero
+    ese formato no es el que espera la API: el filtro terminaba
+    ignorandose en silencio (la busqueda devolvia de mas, sin filtrar
+    por fecha).
+    """
     q = parse_qs(urlparse(url).query, keep_blank_values=True)
     params = {}
-    mins, maxs = {}, {}
 
     for k, valores in q.items():
         if k in IGNORAR:
             continue
-        m = re.match(r"^f\.(.+)\.(min|max)$", k)
-        if m:                                   # f.dateIssued.min / .max
-            campo, cual = m.groups()
-            (mins if cual == "min" else maxs)[campo] = valores[0]
-            continue
         params.setdefault(k, []).extend(valores)
-
-    # rangos -> f.campo=[min TO max],equals
-    for campo in set(mins) | set(maxs):
-        lo = mins.get(campo, "*")
-        hi = maxs.get(campo, "*")
-        params.setdefault(f"f.{campo}", []).append(f"[{lo} TO {hi}],equals")
 
     params.setdefault("configuration", ["workflow"])
     params.setdefault("query", ["*"])
