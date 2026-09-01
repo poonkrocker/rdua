@@ -16,12 +16,21 @@ Variables de entorno:
   RDU_PASSWORD contrasena de RDU
   RDU_DEBUG=1  vuelca el JSON del primer objeto y corta (para verificar estructura)
 
+El filtro de fecha (f.dateIssued.min/.max) se manda al servidor como rango
+[min TO max],equals (formato documentado por DSpace), y ADEMAS se vuelve a
+chequear del lado del cliente contra dc.date.issued de cada item: los
+items en workflow (todavia no publicados) pueden no estar indexados igual
+que los archivados, asi que el facet de fecha del servidor podria no
+filtrar bien. Si eso pasa, el script lo avisa por log y descarta los
+sobrantes igual, asi el CSV final siempre respeta el rango pedido.
+
 Salida: workflow_links.csv  (encabezado: Link,Titulo)
 """
 
 import csv
 import json
 import os
+import re
 import sys
 import time
 from urllib.parse import urlparse, parse_qs
@@ -61,24 +70,42 @@ IGNORAR = {"spc.page", "page", "size", "spc.sf", "spc.sd", "spc.rpp"}
 def params_desde_url(url):
     """Traduce los query params de la UI a params de /discover/search/objects.
 
-    f.campo.min / f.campo.max (ej. f.dateIssued.min/.max) se reenvian TAL
-    CUAL, sueltos — asi los manda la UI de Angular al backend. Antes se
-    combinaban a mano en un rango tipo f.campo=[min TO max],equals, pero
-    ese formato no es el que espera la API: el filtro terminaba
-    ignorandose en silencio (la busqueda devolvia de mas, sin filtrar
-    por fecha).
+    f.campo.min / f.campo.max (ej. f.dateIssued.min/.max) se combinan en
+    un rango f.campo=[min TO max],equals — es el formato de filtro que
+    documenta el RestContract de DSpace (f.<filtro>=<valor>,<operador>).
+    Enviar min/max sueltos (como los usa la UI de Angular puertas adentro)
+    no es un formato valido para la API REST y devuelve 422.
+
+    Devuelve (params, rango_fechas): rango_fechas es {campo: (min, max)}
+    para poder aplicar el mismo filtro del lado del cliente como red de
+    seguridad, por si el facet de fecha no se aplica bien contra la
+    configuracion "workflow" (los items en revision pueden no estar
+    indexados igual que los archivados).
     """
     q = parse_qs(urlparse(url).query, keep_blank_values=True)
     params = {}
+    mins, maxs = {}, {}
 
     for k, valores in q.items():
         if k in IGNORAR:
             continue
+        m = re.match(r"^f\.(.+)\.(min|max)$", k)
+        if m:
+            campo, cual = m.groups()
+            (mins if cual == "min" else maxs)[campo] = valores[0]
+            continue
         params.setdefault(k, []).extend(valores)
+
+    rango_fechas = {}
+    for campo in set(mins) | set(maxs):
+        lo = mins.get(campo, "*")
+        hi = maxs.get(campo, "*")
+        params.setdefault(f"f.{campo}", []).append(f"[{lo} TO {hi}],equals")
+        rango_fechas[campo] = (lo, hi)
 
     params.setdefault("configuration", ["workflow"])
     params.setdefault("query", ["*"])
-    return params
+    return params, rango_fechas
 
 
 def login(client):
@@ -116,6 +143,8 @@ def get_json(client, url, params=None, intentos=4):
             ultimo = e
         except httpx.HTTPStatusError as e:
             if e.response.status_code < 500:
+                print(f"  [DEBUG] Respuesta del servidor ({e.response.status_code}): "
+                      f"{e.response.text[:2000]}", file=sys.stderr)
                 raise
             ultimo = e
         espera = 2 ** i
@@ -165,21 +194,47 @@ def extraer(obj):
         titulo = _titulo_de_sections(wfi)
 
     uuid = item.get("uuid", "")
+
+    fecha = ""
+    if md.get("dc.date.issued"):
+        fecha = md["dc.date.issued"][0].get("value", "")
+
     return {
         "tarea_id": tarea_id,
         "workflowitem_id": wf_id,
         "item_uuid": uuid,
         "titulo": titulo,
+        "fecha": fecha,
         "link_workflow": f"{BASE}/workflowitems/{wf_id}/edit" if wf_id else "",
         "link_item": f"{BASE}/items/{uuid}" if uuid else "",
     }
 
 
+def _pasa_filtro_fecha(fila: dict, rango_fechas: dict) -> bool:
+    """Chequea del lado del cliente que el año de dc.date.issued caiga
+    dentro de los rangos pedidos (red de seguridad si el facet del
+    servidor no filtro bien para items en workflow)."""
+    rango = rango_fechas.get("dateIssued")
+    if not rango:
+        return True
+    lo, hi = rango
+    m = re.match(r"^(\d{4})", fila.get("fecha") or "")
+    if not m:
+        return True  # sin fecha parseable: no la descartamos, mejor que se revise a mano
+    anio = int(m.group(1))
+    if lo != "*" and anio < int(lo):
+        return False
+    if hi != "*" and anio > int(hi):
+        return False
+    return True
+
+
 def main():
-    params = params_desde_url(UI_URL)
+    params, rango_fechas = params_desde_url(UI_URL)
     print("Filtros:", json.dumps(params, ensure_ascii=False), file=sys.stderr)
 
     filas = []
+    descartados_por_fecha = 0
     with httpx.Client(timeout=TIMEOUT, headers=HEADERS, follow_redirects=True) as client:
         login(client)
 
@@ -209,9 +264,14 @@ def main():
                 break
 
             for o in objetos:
-                filas.append(extraer(o["_embedded"]["indexableObject"]))
+                fila = extraer(o["_embedded"]["indexableObject"])
+                if _pasa_filtro_fecha(fila, rango_fechas):
+                    filas.append(fila)
+                else:
+                    descartados_por_fecha += 1
 
-            print(f"  pagina {page+1}/{info.get('totalPages')} -> {len(filas)} acumulados",
+            print(f"  pagina {page+1}/{info.get('totalPages')} -> {len(filas)} acumulados "
+                  f"({descartados_por_fecha} descartados por fecha)",
                   file=sys.stderr)
 
             if page + 1 >= info.get("totalPages", 1):
@@ -226,6 +286,13 @@ def main():
         w.writerow(["Link", "Titulo"])
         for f in filas:
             w.writerow([f["link_workflow"] or f["link_item"], f["titulo"]])
+
+    aviso = ""
+    if descartados_por_fecha:
+        aviso = (f"  [AVISO] {descartados_por_fecha} item(s) vinieron del servidor fuera del rango "
+                 f"de fecha pedido y se descartaron aca (el filtro server-side de 'dateIssued' no "
+                 f"parece aplicarse bien contra items en workflow).")
+        print(aviso, file=sys.stderr)
 
     print(f"\nOK -> {OUT_CSV}  ({len(filas)} items)")
 
