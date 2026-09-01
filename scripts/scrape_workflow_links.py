@@ -24,7 +24,12 @@ que los archivados, asi que el facet de fecha del servidor podria no
 filtrar bien. Si eso pasa, el script lo avisa por log y descarta los
 sobrantes igual, asi el CSV final siempre respeta el rango pedido.
 
-Salida: workflow_links.csv  (encabezado: Link,Titulo)
+Salida: workflow_links.csv  (encabezado: Link,Titulo,Bytes,DetalleAdjunto)
+Por cada item hace una consulta extra para traer el tamaño del bundle
+ORIGINAL (bitstream mas grande). DetalleAdjunto queda vacio si esta OK,
+o dice "SIN ARCHIVO ADJUNTO" / "ADJUNTO VACÍO/ROTO" (umbral configurable
+con UMBRAL_BYTES_VACIO, por defecto 42 bytes — mismo criterio que
+chequear_adjuntos.py).
 """
 
 import csv
@@ -53,6 +58,8 @@ DEBUG = os.environ.get("RDU_DEBUG", "") == "1"
 PAGE_SIZE = 100
 TIMEOUT = 60
 OUT_CSV = "workflow_links.csv"
+UMBRAL_BYTES_VACIO = int(os.environ.get("UMBRAL_BYTES_VACIO", "42"))
+PAUSA_SEGUNDOS = float(os.environ.get("PAUSA_SEGUNDOS", "0.3"))  # entre consultas de bytes, para no saturar
 
 HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -229,6 +236,39 @@ def _pasa_filtro_fecha(fila: dict, rango_fechas: dict) -> bool:
     return True
 
 
+def _tamano_adjunto(client, uuid: str):
+    """Consulta el item por uuid con sus bundles/bitstreams y devuelve
+    (detalle, bytes) del bundle ORIGINAL: detalle vacio si esta OK,
+    'SIN ARCHIVO ADJUNTO' o 'ADJUNTO VACÍO/ROTO' si hay problema.
+    Misma logica que chequear_adjuntos.py, para que el criterio de
+    'roto' sea consistente entre los dos scripts."""
+    if not uuid:
+        return "SIN ITEM (solo workspace, no llego a tener uuid)", 0
+
+    try:
+        r = client.get(f"{API}/core/items/{uuid}", params={"embed": "bundles/bitstreams"})
+        r.raise_for_status()
+        item = r.json()
+    except Exception as e:
+        print(f"  [WARN] No se pudo consultar adjuntos de {uuid}: {e}", file=sys.stderr)
+        return f"ERROR AL CONSULTAR ({e})", 0
+
+    bundles = item.get("_embedded", {}).get("bundles", {}).get("_embedded", {}).get("bundles", [])
+    original = next((b for b in bundles if b.get("name") == "ORIGINAL"), None)
+    if not original:
+        return "SIN ARCHIVO ADJUNTO", 0
+
+    bitstreams = (original.get("_embedded", {}).get("bitstreams", {})
+                  .get("_embedded", {}).get("bitstreams", []))
+    if not bitstreams:
+        return "SIN ARCHIVO ADJUNTO", 0
+
+    tam = max(b.get("sizeBytes", 0) for b in bitstreams)
+    if tam <= UMBRAL_BYTES_VACIO:
+        return "ADJUNTO VACÍO/ROTO", tam
+    return "", tam
+
+
 def main():
     params, rango_fechas = params_desde_url(UI_URL)
     print("Filtros:", json.dumps(params, ensure_ascii=False), file=sys.stderr)
@@ -278,14 +318,24 @@ def main():
                 break
             page += 1
 
+        print(f"Consultando tamaño de adjuntos de {len(filas)} item(s)...", file=sys.stderr)
+        for i, fila in enumerate(filas, start=1):
+            detalle, tam = _tamano_adjunto(client, fila["item_uuid"])
+            fila["detalle_adjunto"] = detalle
+            fila["bytes"] = tam
+            if i % 20 == 0:
+                print(f"  {i}/{len(filas)} adjuntos consultados...", file=sys.stderr)
+            time.sleep(PAUSA_SEGUNDOS)
+
     if not filas:
         sys.exit("No se encontraron items con esos filtros.")
 
     with open(OUT_CSV, "w", newline="", encoding="utf-8-sig") as fh:
         w = csv.writer(fh)
-        w.writerow(["Link", "Titulo"])
+        w.writerow(["Link", "Titulo", "Bytes", "DetalleAdjunto"])
         for f in filas:
-            w.writerow([f["link_workflow"] or f["link_item"], f["titulo"]])
+            w.writerow([f["link_workflow"] or f["link_item"], f["titulo"],
+                        f.get("bytes", ""), f.get("detalle_adjunto", "")])
 
     aviso = ""
     if descartados_por_fecha:
@@ -294,7 +344,8 @@ def main():
                  f"parece aplicarse bien contra items en workflow).")
         print(aviso, file=sys.stderr)
 
-    print(f"\nOK -> {OUT_CSV}  ({len(filas)} items)")
+    rotos = sum(1 for f in filas if f.get("detalle_adjunto"))
+    print(f"\nOK -> {OUT_CSV}  ({len(filas)} items, {rotos} con adjunto roto/vacío/faltante)")
 
 
 if __name__ == "__main__":
