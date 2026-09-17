@@ -1,0 +1,51 @@
+name: Marcar adjuntos rotos en Workflow RDU
+
+on:
+  workflow_dispatch:
+    inputs:
+      ui_url:
+        description: "URL de MyDSpace con los filtros"
+        required: true
+        default: "https://rdu.unc.edu.ar/mydspace?configuration=workflow&f.itemtype=article,equals&spc.page=1&f.dateIssued.min=2014&f.dateIssued.max=2014"
+      umbral_bytes:
+        description: "Umbral de tamaño en bytes para considerar roto/vacío (default: 1024 = 1 KB)"
+        required: true
+        default: "1024"
+      dry_run:
+        description: "Modo simulación (true = NO modifica nada en RDU, solo genera reporte de prueba)"
+        type: boolean
+        required: true
+        default: true
+      limite:
+        description: "Límite de ítems a procesar (0 = sin límite, o ej. 1 o 5 para probar)"
+        required: false
+        default: "0"
+
+jobs:
+  marcar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install httpx
+
+      - name: Ejecutar marcado de adjuntos rotos
+        env:
+          RDU_UI_URL: ${{ github.event.inputs.ui_url }}
+          UMBRAL_BYTES: ${{ github.event.inputs.umbral_bytes }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          LIMITE: ${{ github.event.inputs.limite }}
+          RDU_EMAIL: ${{ secrets.RDU_USER }}
+          RDU_PASSWORD: ${{ secrets.RDU_PASS }}
+        run: python scripts/marcar_adjuntos_rotos_workflow.py
+
+      - name: Subir reporte CSV
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reporte-adjuntos-marcados
+          path: reportes/*.csv
