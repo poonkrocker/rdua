@@ -16,18 +16,18 @@ Flujo por cada ítem:
   1. Localiza el adjunto (en sections['upload']['files'] o en bundles ORIGINAL)
      y lo descarga vía REST API autenticada.
   2. Extrae el texto de las primeras páginas del PDF (donde están título y autores).
-  3. Consulta a DeepSeek para comparar metadatos de RDU vs PDF:
-     - Detecta autores faltantes en RDU y los agrega.
-     - Corrige nombres abreviados, apellidos invertidos o mal escritos.
-     - Corrige el título si tiene erratas o formato inadecuado.
-     - Genera una síntesis breve de las modificaciones realizadas.
-  4. Si hubo cambios:
+  3. Consulta a DeepSeek para evaluar dos situaciones:
+     - CASO A: SI EL ADJUNTO NO CORRESPONDE AL ARTÍCULO (título y autores completamente
+       diferentes):
+       * NO sobreescribe los autores ni el título de RDU.
+       * Agrega al INICIO del campo Resumen: [ADJUNTO NO CORRESPONDE].
+       * Agrega al final una nota con el artículo al que pertenecía el archivo adjunto.
+     - CASO B: SI EL ADJUNTO SÍ CORRESPONDE AL ARTÍCULO (mismo trabajo pero con diferencias):
+       * Corrige/agrega autores y ajusta el título según el PDF.
+       * Agrega al final del Resumen entre corchetes: [Modificaciones: ...].
+  4. Si hubo cambios o marca:
      - Asume la tarea en el workflow si está en el pool (POST /api/workflow/claimedtasks).
-     - Aplica los cambios vía JSON Patch:
-         * Actualiza dc.contributor.author.
-         * Actualiza dc.title si varió.
-         * Agrega al final del Resumen (dc.description.abstract) entre corchetes:
-           [Modificaciones: ...]
+     - Aplica los cambios vía JSON Patch en el workflowitem.
      - Devuelve la tarea al pool general (DELETE /api/workflow/claimedtasks/{id}).
   5. Genera un reporte detallado en CSV.
 
@@ -52,9 +52,7 @@ from pypdf import PdfReader
 BASE_URL = os.environ.get("RDU_BASE_URL", "https://rdu.unc.edu.ar").rstrip("/")
 API = f"{BASE_URL}/server/api"
 
-DEFAULT_UI_URL = (
-    f"{BASE_URL}/workflowitems/50076/edit"
-)
+DEFAULT_UI_URL = f"{BASE_URL}/workflowitems/50076/edit"
 
 IGNORAR_PARAMS = {"spc.page", "page", "size", "spc.sf", "spc.sd", "spc.rpp"}
 
@@ -476,7 +474,6 @@ def descargar_y_extraer_texto_pdf(client: httpx.Client, wf_id: str, item_uuid: s
     nombres_archivos = [f"{a.get('nombre')} ({a.get('sizeBytes')}B, {a.get('origen')})" for a in archivos]
     print(f"  [ARCHIVOS] Detectados {len(archivos)} archivo(s): {', '.join(nombres_archivos)}", file=sys.stderr)
 
-    # Seleccionar bitstream de PDF
     candidato_pdf = None
     for a in archivos:
         nombre = (a.get("nombre") or "").lower()
@@ -484,7 +481,6 @@ def descargar_y_extraer_texto_pdf(client: httpx.Client, wf_id: str, item_uuid: s
             candidato_pdf = a
             break
     if not candidato_pdf:
-        # Si ninguno termina en .pdf, tomar el archivo más grande
         candidato_pdf = max(archivos, key=lambda x: x.get("sizeBytes", 0))
 
     content_url = candidato_pdf.get("url")
@@ -510,7 +506,6 @@ def descargar_y_extraer_texto_pdf(client: httpx.Client, wf_id: str, item_uuid: s
         reader = PdfReader(io.BytesIO(pdf_bytes))
         num_paginas = len(reader.pages)
         texto = ""
-        # Extraer texto de hasta las primeras 4 páginas
         for p in reader.pages[:4]:
             texto += (p.extract_text() or "") + "\n"
 
@@ -524,33 +519,36 @@ def descargar_y_extraer_texto_pdf(client: httpx.Client, wf_id: str, item_uuid: s
 
 
 def consultar_deepseek(client_ai: OpenAI, model: str, titulo_rdu: str, autores_rdu: list[str], texto_pdf: str) -> dict:
+    """Evalúa si el PDF corresponde al artículo registrado y propone correcciones o marca de discrepancia."""
     system_prompt = (
         "Sos un catalogador bibliográfico experto en el Repositorio Digital Universitario (RDU - Universidad Nacional de Córdoba, Argentina).\n"
         "Tu tarea es cotejar los metadatos cargados en RDU (Título y Autores) contra el texto real de las primeras páginas del documento adjunto (PDF).\n\n"
-        "Instrucciones:\n"
+        "CRÍTICO - EVALUACIÓN DE CORRESPONDENCIA:\n"
+        "1. ¿El documento adjunto corresponde realmente al trabajo registrado en RDU, o se adjuntó un DOCUMENTO EQUIVOCADO?\n"
+        "   - Si el título del PDF y los autores del PDF NO TIENEN NADA QUE VER con los metadatos de RDU (artículo completamente diferente),\n"
+        "     debes indicar obligatoriamente: 'adjunto_corresponde': false.\n"
+        "     En 'motivo_no_corresponde' explica brevemente cuál es el artículo real que viene en el PDF.\n"
+        "   - Si el documento sí es el mismo artículo (aunque tenga autores que no habían sido cargados, nombres con iniciales a completar,\n"
+        "     o pequeñas erratas en el título), indica: 'adjunto_corresponde': true.\n\n"
+        "Instrucciones si 'adjunto_corresponde' es true:\n"
         "1. TÍTULO:\n"
-        "   - Verifica si el título cargado coincide con el del PDF.\n"
-        "   - Corrige erratas evidentes, mayúsculas sostenidas a sentence case (mayúscula solo en primera letra y nombres propios/siglas como UNC, CONICET, etc.).\n"
-        "   - Si el título cargado ya es correcto, consérvalo tal cual.\n\n"
+        "   - Corrige erratas evidentes o mayúsculas sostenidas a sentence case.\n"
+        "   - Si ya es correcto, consérvalo tal cual.\n\n"
         "2. AUTORES:\n"
-        "   - Identifica a TODOS los autores reales del artículo según figuran en el PDF.\n"
-        "   - Contrasta con los autores cargados en RDU:\n"
-        "     * Si falta algún autor en RDU pero figura en el PDF, agrégalo respetando el orden del documento.\n"
-        "     * Si un autor en RDU está con iniciales o abreviado y en el PDF figura su nombre completo, complétalo.\n"
-        "     * Si el apellido/nombre está invertido o mal escrito, corrígelo.\n"
-        "     * Si hay alguien cargado en RDU que NO figura en el PDF, elimínalo.\n"
+        "   - Identifica a TODOS los autores reales según figuran en el PDF.\n"
+        "   - Contrasta con los autores de RDU: agrega los faltantes respetando el orden, completa nombres abreviados, corrige orden.\n"
         "   - Formato obligatorio para cada autor: 'Apellido, Nombre' (o 'Apellido, Nombre1 Nombre2').\n\n"
         "3. RESUMEN DE MODIFICACIONES:\n"
-        "   - Si realizas cambios en título o autores, redacta una nota BREVE y precisa para informar los cambios.\n"
-        "     Ejemplos:\n"
-        "       'Modificaciones: se completó el nombre de Abate, P. a Abate, Paula; se agregó autor Gómez, María'\n"
-        "       'Modificaciones: se corrigió el título según PDF; se corrigió autor LOPEZ JUAN a López, Juan'\n"
-        "   - Si NO hubo cambios, deja resumen_modificaciones como cadena vacía.\n\n"
-        "4. FORMATO DE RESPUESTA OBLIGATORIO (JSON ESTRICTO SIN CÓDIGO NI EXPLICACIONES EXTRA):\n"
+        "   - Si realizas cambios en título o autores, redacta una nota BREVE y precisa.\n"
+        "     Ejemplo: 'Modificaciones: se completó el nombre de Abate, P. a Abate, Paula; se agregó autor Gómez, María'\n"
+        "   - Si no hubo cambios, deja cadena vacía.\n\n"
+        "FORMATO DE RESPUESTA OBLIGATORIO (JSON ESTRICTO):\n"
         "{\n"
+        '  "adjunto_corresponde": true o false,\n'
+        '  "motivo_no_corresponde": "Breve explicación si adjunto_corresponde es false, o vacío",\n'
         '  "titulo_corregido": "Título corregido o idéntico",\n'
         '  "autores_corregidos": ["Apellido, Nombre", ...],\n'
-        '  "hubo_cambios": true/false,\n'
+        '  "hubo_cambios": true o false,\n'
         '  "cambios_titulo": "descripción del cambio o vacío",\n'
         '  "cambios_autores": "descripción del cambio o vacío",\n'
         '  "resumen_modificaciones": "Modificaciones: ... o vacío"\n'
@@ -586,7 +584,7 @@ def consultar_deepseek(client_ai: OpenAI, model: str, titulo_rdu: str, autores_r
             print(f"  [WARN] Falló llamada a DeepSeek (intento {intento}/3): {e}", file=sys.stderr)
             time.sleep(2 * intento)
 
-    return {"hubo_cambios": False, "error": "No se pudo obtener respuesta estructurada de DeepSeek"}
+    return {"adjunto_corresponde": True, "hubo_cambios": False, "error": "No se pudo obtener respuesta estructurada de DeepSeek"}
 
 
 def asumir_tarea(client: httpx.Client, pooltask_id: str) -> str:
@@ -598,6 +596,72 @@ def asumir_tarea(client: httpx.Client, pooltask_id: str) -> str:
     if r.status_code not in (200, 201):
         raise RuntimeError(f"Fallo al asumir tarea {pooltask_id}: HTTP {r.status_code} - {r.text[:300]}")
     return str(r.json().get("id", ""))
+
+
+def marcar_adjunto_no_corresponde(
+    client: httpx.Client,
+    workflowitem_id: str,
+    motivo: str,
+) -> str:
+    """Precede el campo Resumen con [ADJUNTO NO CORRESPONDE] y añade nota explicativa sin tocar autores ni título."""
+    url_wfi = f"{API}/workflow/workflowitems/{workflowitem_id}"
+    r = client.get(url_wfi)
+    r.raise_for_status()
+    wfi_data = r.json()
+
+    sections = wfi_data.get("sections", {}) or {}
+    sid_resumen = None
+    val_resumen = None
+    for sid, sval in sections.items():
+        if isinstance(sval, dict) and "dc.description.abstract" in sval:
+            sid_resumen = sid
+            val_resumen = sval["dc.description.abstract"]
+            break
+
+    sid_resumen = sid_resumen or ("traditionalpageone" if "traditionalpageone" in sections else list(sections.keys())[0])
+
+    resumen_actual = ""
+    lang_resumen = "es"
+    if val_resumen and len(val_resumen) > 0:
+        resumen_actual = val_resumen[0].get("value", "")
+        lang_resumen = val_resumen[0].get("language") or "es"
+
+    marca = "[ADJUNTO NO CORRESPONDE]"
+    # Agregar marca al inicio si no la tiene
+    if not re.search(r"ADJUNTO\s+NO\s+CORRESPONDE", resumen_actual, re.IGNORECASE):
+        nuevo_cuerpo = f"{marca} {resumen_actual}".strip()
+    else:
+        nuevo_cuerpo = resumen_actual
+
+    # Agregar nota explicativa si se proporcionó motivo
+    if motivo and f"[{motivo}]" not in nuevo_cuerpo:
+        resumen_nuevo = f"{nuevo_cuerpo}\n\n[{motivo}]".strip()
+    else:
+        resumen_nuevo = nuevo_cuerpo
+
+    if resumen_nuevo == resumen_actual:
+        return resumen_actual
+
+    patch_ops = []
+    if val_resumen and len(val_resumen) > 0:
+        patch_ops.append({
+            "op": "replace",
+            "path": f"/sections/{sid_resumen}/dc.description.abstract/0",
+            "value": {"value": resumen_nuevo, "language": lang_resumen},
+        })
+    else:
+        patch_ops.append({
+            "op": "add",
+            "path": f"/sections/{sid_resumen}/dc.description.abstract/-",
+            "value": {"value": resumen_nuevo, "language": lang_resumen},
+        })
+
+    headers = _headers_con_csrf(client, {"Content-Type": "application/json"})
+    r_patch = client.patch(url_wfi, json=patch_ops, headers=headers)
+    if r_patch.status_code not in (200, 201):
+        raise RuntimeError(f"Fallo al marcar resumen en workflowitem {workflowitem_id}: HTTP {r_patch.status_code} - {r_patch.text[:300]}")
+
+    return resumen_nuevo
 
 
 def aplicar_cambios_workflowitem(
@@ -815,11 +879,92 @@ def procesar_flujo(
                 continue
 
             # Cotejar con DeepSeek
-            print("  Consultando a DeepSeek para cotejar metadatos vs PDF...")
+            print("  Consultando a DeepSeek para evaluar correspondencia y metadatos vs PDF...")
             analisis = consultar_deepseek(client_ai, deepseek_model, titulo_rdu, autores_rdu, texto_pdf)
 
+            # CASO A: EL PDF ADJUNTO NO CORRESPONDE AL ARTÍCULO
+            if analisis.get("adjunto_corresponde") is False:
+                motivo = analisis.get("motivo_no_corresponde") or "El PDF adjunto pertenece a otro artículo completamente diferente"
+                print(f"  [ALERTA] ADJUNTO NO CORRESPONDE: {motivo}")
+                print(f"  -> NO se modifican autores ni título. Se marcará [ADJUNTO NO CORRESPONDE] en el resumen.")
+
+                if dry_run:
+                    print("  [SIMULACIÓN] Se agregaría '[ADJUNTO NO CORRESPONDE]' al inicio del Resumen sin modificar autores/título.")
+                    filas_reporte.append({
+                        "Fecha": datetime.now().isoformat(),
+                        "Workflowitem_ID": wf_id,
+                        "Item_UUID": uuid,
+                        "Titulo_Anterior": titulo_rdu,
+                        "Titulo_Nuevo": titulo_rdu,
+                        "Autores_Anteriores": "; ".join(autores_rdu),
+                        "Autores_Nuevos": "; ".join(autores_rdu),
+                        "Modificaciones": motivo,
+                        "Accion": "SIMULADO_ADJUNTO_NO_CORRESPONDE",
+                        "Link_Workflow": item["link_workflow"],
+                        "Link_Item": item["link_item"],
+                    })
+                    conteo_modificados += 1
+                else:
+                    try:
+                        pool_id = item.get("pooltask_id")
+                        claimed_id = item.get("claimedtask_id")
+                        if not pool_id and not claimed_id:
+                            pool_id = buscar_pooltask_id(client, uuid)
+
+                        if not claimed_id:
+                            if not pool_id:
+                                raise RuntimeError(f"No se encontró pooltask para el ítem {uuid}")
+                            claimed_id = asumir_tarea(client, pool_id)
+                            print(f"  [1/3] Tarea asumida (claimedtask_id: {claimed_id})")
+                        else:
+                            print(f"  [1/3] Tarea ya estaba asumida (claimedtask_id: {claimed_id})")
+
+                        marcar_adjunto_no_corresponde(client, wf_id, motivo)
+                        print(f"  [2/3] Resumen marcado con '[ADJUNTO NO CORRESPONDE]'. Autores y título intactos.")
+
+                        devolver_tarea_al_pool(client, claimed_id)
+                        print(f"  [3/3] Tarea devuelta al pool general.")
+
+                        filas_reporte.append({
+                            "Fecha": datetime.now().isoformat(),
+                            "Workflowitem_ID": wf_id,
+                            "Item_UUID": uuid,
+                            "Titulo_Anterior": titulo_rdu,
+                            "Titulo_Nuevo": titulo_rdu,
+                            "Autores_Anteriores": "; ".join(autores_rdu),
+                            "Autores_Nuevos": "; ".join(autores_rdu),
+                            "Modificaciones": motivo,
+                            "Accion": "MARCADO_ADJUNTO_NO_CORRESPONDE",
+                            "Link_Workflow": item["link_workflow"],
+                            "Link_Item": item["link_item"],
+                        })
+                        conteo_modificados += 1
+                    except Exception as e:
+                        conteo_errores += 1
+                        print(f"  [ERROR] Falló al marcar {wf_id}: {e}", file=sys.stderr)
+                        filas_reporte.append({
+                            "Fecha": datetime.now().isoformat(),
+                            "Workflowitem_ID": wf_id,
+                            "Item_UUID": uuid,
+                            "Titulo_Anterior": titulo_rdu,
+                            "Titulo_Nuevo": titulo_rdu,
+                            "Autores_Anteriores": "; ".join(autores_rdu),
+                            "Autores_Nuevos": "; ".join(autores_rdu),
+                            "Modificaciones": f"ERROR: {e}",
+                            "Accion": "ERROR",
+                            "Link_Workflow": item["link_workflow"],
+                            "Link_Item": item["link_item"],
+                        })
+
+                time.sleep(pausa_segundos)
+                if limite > 0 and conteo_modificados >= limite:
+                    print(f"\n[LIMITE] Se alcanzó el límite de {limite} ítem(s). Finalizando.")
+                    break
+                continue
+
+            # CASO B: EL ADJUNTO SÍ CORRESPONDE AL ARTÍCULO
             if not analisis.get("hubo_cambios"):
-                print("  [OK] DeepSeek determinó que NO se requieren modificaciones.")
+                print("  [OK] DeepSeek determinó que el documento coincide y NO se requieren modificaciones.")
                 filas_reporte.append({
                     "Fecha": datetime.now().isoformat(),
                     "Workflowitem_ID": wf_id,
@@ -927,7 +1072,7 @@ def procesar_flujo(
             time.sleep(pausa_segundos)
 
             if limite > 0 and conteo_modificados >= limite:
-                print(f"\n[LIMITE] Se alcanzó el límite de {limite} ítem(s) modificados. Finalizando.")
+                print(f"\n[LIMITE] Se alcanzó el límite de {limite} ítem(s) procesados. Finalizando.")
                 break
 
     os.makedirs(os.path.dirname(archivo_csv) or ".", exist_ok=True)
