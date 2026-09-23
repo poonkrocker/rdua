@@ -13,7 +13,8 @@ Permite:
      (ej. .../mydspace?configuration=workflow&f.itemtype=article...).
 
 Flujo por cada ítem:
-  1. Descarga el archivo del bundle ORIGINAL (PDF) por API REST de DSpace.
+  1. Localiza el adjunto (en sections['upload']['files'] o en bundles ORIGINAL)
+     y lo descarga vía REST API autenticada.
   2. Extrae el texto de las primeras páginas del PDF (donde están título y autores).
   3. Consulta a DeepSeek para comparar metadatos de RDU vs PDF:
      - Detecta autores faltantes en RDU y los agrega.
@@ -376,44 +377,128 @@ def pasa_filtro_fecha(fila: dict, rango_fechas: dict) -> bool:
     return True
 
 
-def descargar_y_extraer_texto_pdf(client: httpx.Client, item_uuid: str) -> tuple[str, str]:
-    """Descarga el bitstream del bundle ORIGINAL y extrae texto de las primeras páginas."""
-    if not item_uuid:
-        return "", "SIN UUID"
+def obtener_archivos_workflowitem(client: httpx.Client, wf_id: str, item_uuid: str) -> list[dict]:
+    """Localiza todos los archivos adjuntos del ítem revisando tanto
+    las secciones del workflowitem (sections['upload']['files']) como los bundles del item.
+    """
+    archivos = []
 
-    try:
-        r = client.get(f"{API}/core/items/{item_uuid}", params={"embed": "bundles/bitstreams"})
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        return "", f"ERROR AL OBTENER BUNDLES: {e}"
+    # 1. Buscar en las secciones del workflowitem (sections['upload']['files'])
+    if wf_id:
+        try:
+            r = client.get(f"{API}/workflow/workflowitems/{wf_id}")
+            if r.status_code == 200:
+                wfi = r.json()
+                sections = wfi.get("sections", {}) or {}
+                for sname, sdata in sections.items():
+                    if isinstance(sdata, dict) and "files" in sdata and isinstance(sdata["files"], list):
+                        for f in sdata["files"]:
+                            nombre = ""
+                            if f.get("metadata", {}).get("dc.title"):
+                                nombre = f["metadata"]["dc.title"][0].get("value", "")
+                            elif f.get("name"):
+                                nombre = f["name"]
 
-    bundles = data.get("_embedded", {}).get("bundles", {}).get("_embedded", {}).get("bundles", [])
-    original = next((b for b in bundles if b.get("name") == "ORIGINAL"), None)
-    if not original:
-        return "", "SIN BUNDLE ORIGINAL"
+                            fid = f.get("uuid") or f.get("id") or ""
+                            url_descarga = f.get("url") or (f.get("_links", {}).get("content", {}).get("href"))
+                            if not url_descarga and fid:
+                                url_descarga = f"{API}/core/bitstreams/{fid}/content"
 
-    bitstreams = original.get("_embedded", {}).get("bitstreams", {}).get("_embedded", {}).get("bitstreams", [])
-    if not bitstreams:
-        return "", "SIN ARCHIVOS ADJUNTOS"
+                            archivos.append({
+                                "nombre": nombre or f"archivo_{fid}.pdf",
+                                "sizeBytes": f.get("sizeBytes", 0),
+                                "url": url_descarga,
+                                "uuid": fid,
+                                "origen": f"section_{sname}",
+                            })
+        except Exception as e:
+            print(f"  [DEBUG] Error leyendo secciones de workflowitem {wf_id}: {e}", file=sys.stderr)
+
+    # 2. Si no encontró en sections, buscar en bundles del item
+    if not archivos and item_uuid:
+        try:
+            r = client.get(f"{API}/core/items/{item_uuid}?embed=bundles/bitstreams")
+            if r.status_code == 200:
+                item_data = r.json()
+                bundles = item_data.get("_embedded", {}).get("bundles", {}).get("_embedded", {}).get("bundles", [])
+                for b in bundles:
+                    if b.get("name") == "ORIGINAL":
+                        bitstreams = (b.get("_embedded", {}).get("bitstreams", {})
+                                       .get("_embedded", {}).get("bitstreams", []))
+                        for bit in bitstreams:
+                            fid = bit.get("id") or bit.get("uuid") or ""
+                            url_d = bit.get("_links", {}).get("content", {}).get("href")
+                            if not url_d and fid:
+                                url_d = f"{API}/core/bitstreams/{fid}/content"
+                            archivos.append({
+                                "nombre": bit.get("name", ""),
+                                "sizeBytes": bit.get("sizeBytes", 0),
+                                "url": url_d,
+                                "uuid": fid,
+                                "origen": "bundle_ORIGINAL",
+                            })
+        except Exception as e:
+            print(f"  [DEBUG] Error leyendo bundles de {item_uuid}: {e}", file=sys.stderr)
+
+    # 3. Endpoint alternativo directo /core/items/{uuid}/bundles
+    if not archivos and item_uuid:
+        try:
+            r = client.get(f"{API}/core/items/{item_uuid}/bundles")
+            if r.status_code == 200:
+                bundles = r.json().get("_embedded", {}).get("bundles", [])
+                for b in bundles:
+                    if b.get("name") == "ORIGINAL":
+                        r_bits = client.get(f"{API}/core/bundles/{b.get('id')}/bitstreams")
+                        if r_bits.status_code == 200:
+                            bits = r_bits.json().get("_embedded", {}).get("bitstreams", [])
+                            for bit in bits:
+                                fid = bit.get("id") or ""
+                                url_d = bit.get("_links", {}).get("content", {}).get("href") or f"{API}/core/bitstreams/{fid}/content"
+                                archivos.append({
+                                    "nombre": bit.get("name", ""),
+                                    "sizeBytes": bit.get("sizeBytes", 0),
+                                    "url": url_d,
+                                    "uuid": fid,
+                                    "origen": "bundles_endpoint",
+                                })
+        except Exception as e:
+            print(f"  [DEBUG] Error consultando /bundles: {e}", file=sys.stderr)
+
+    return archivos
+
+
+def descargar_y_extraer_texto_pdf(client: httpx.Client, wf_id: str, item_uuid: str) -> tuple[str, str]:
+    """Descarga el PDF y extrae texto de las primeras páginas."""
+    archivos = obtener_archivos_workflowitem(client, wf_id, item_uuid)
+    if not archivos:
+        return "", "SIN ARCHIVOS ADJUNTOS ENCONTRADOS (ni en secciones de upload ni en bundles)"
+
+    nombres_archivos = [f"{a.get('nombre')} ({a.get('sizeBytes')}B, {a.get('origen')})" for a in archivos]
+    print(f"  [ARCHIVOS] Detectados {len(archivos)} archivo(s): {', '.join(nombres_archivos)}", file=sys.stderr)
 
     # Seleccionar bitstream de PDF
-    b_pdf = None
-    for b in bitstreams:
-        nombre = (b.get("name") or "").lower()
+    candidato_pdf = None
+    for a in archivos:
+        nombre = (a.get("nombre") or "").lower()
         if nombre.endswith(".pdf"):
-            b_pdf = b
+            candidato_pdf = a
             break
-    if not b_pdf:
-        b_pdf = bitstreams[0]
+    if not candidato_pdf:
+        # Si ninguno termina en .pdf, tomar el archivo más grande
+        candidato_pdf = max(archivos, key=lambda x: x.get("sizeBytes", 0))
 
-    content_url = b_pdf.get("_links", {}).get("content", {}).get("href")
+    content_url = candidato_pdf.get("url")
+    if not content_url and candidato_pdf.get("uuid"):
+        content_url = f"{API}/core/bitstreams/{candidato_pdf['uuid']}/content"
+
     if not content_url:
-        return "", "SIN LINK DE DESCARGA"
+        return "", f"SIN LINK DE DESCARGA PARA '{candidato_pdf.get('nombre')}'"
 
+    print(f"  [DESCARGA] Descargando '{candidato_pdf.get('nombre')}' ({candidato_pdf.get('sizeBytes')} B)...", file=sys.stderr)
     try:
         resp = client.get(content_url)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            return "", f"HTTP {resp.status_code} AL DESCARGAR '{candidato_pdf.get('nombre')}'"
         pdf_bytes = resp.content
     except Exception as e:
         return "", f"ERROR AL DESCARGAR ARCHIVO: {e}"
@@ -423,13 +508,17 @@ def descargar_y_extraer_texto_pdf(client: httpx.Client, item_uuid: str) -> tuple
 
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
+        num_paginas = len(reader.pages)
         texto = ""
-        for p in reader.pages[:3]:
+        # Extraer texto de hasta las primeras 4 páginas
+        for p in reader.pages[:4]:
             texto += (p.extract_text() or "") + "\n"
+
         texto = texto.strip()
+        print(f"  [TEXTO] Extraídos {len(texto)} caracteres de {min(4, num_paginas)} página(s).", file=sys.stderr)
         if not texto:
-            return "", "PDF IMAGEN ESCANEADA (SIN CAPA DE TEXTO)"
-        return texto, f"OK ({len(texto)} caracteres)"
+            return "", f"PDF IMAGEN ESCANEADA / SIN TEXTO EXTRAIBLE ({num_paginas} págs)"
+        return texto, f"OK ({len(texto)} chars de {min(4, num_paginas)} págs)"
     except Exception as e:
         return "", f"ERROR AL PARSEAR PDF: {e}"
 
@@ -705,8 +794,8 @@ def procesar_flujo(
             print(f"\n[PROCESANDO] #{idx} Item: {titulo_rdu[:70]}...")
             print(f"  Autores RDU: {autores_rdu}")
 
-            # Descargar PDF y extraer texto
-            texto_pdf, det_pdf = descargar_y_extraer_texto_pdf(client, uuid)
+            # Descargar PDF y extraer texto (busca en upload sections y en bundles)
+            texto_pdf, det_pdf = descargar_y_extraer_texto_pdf(client, wf_id, uuid)
             if not texto_pdf:
                 print(f"  [OMITIDO] No se pudo extraer texto del PDF: {det_pdf}")
                 filas_reporte.append({
@@ -718,7 +807,7 @@ def procesar_flujo(
                     "Autores_Anteriores": "; ".join(autores_rdu),
                     "Autores_Nuevos": "; ".join(autores_rdu),
                     "Modificaciones": det_pdf,
-                    "Accion": "OMITIDO_SIN_TEXTO_PDF",
+                    "Accion": f"OMITIDO: {det_pdf}",
                     "Link_Workflow": item["link_workflow"],
                     "Link_Item": item["link_item"],
                 })
@@ -838,7 +927,7 @@ def procesar_flujo(
             time.sleep(pausa_segundos)
 
             if limite > 0 and conteo_modificados >= limite:
-                print(f"\n[LIMITE] Se alcanzó el límite de {limite} ítem(s) procesados. Finalizando.")
+                print(f"\n[LIMITE] Se alcanzó el límite de {limite} ítem(s) modificados. Finalizando.")
                 break
 
     os.makedirs(os.path.dirname(archivo_csv) or ".", exist_ok=True)
