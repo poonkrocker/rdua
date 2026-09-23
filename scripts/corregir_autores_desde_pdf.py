@@ -155,6 +155,63 @@ def get_json(client: httpx.Client, url: str, params: dict | None = None, intento
     raise ultimo
 
 
+def extraer_campo_metadatos(sections: dict, metadata_item: dict, campos: list[str] | str) -> list[str]:
+    """Busca uno o más campos de metadatos en las secciones del workflowitem,
+    y si no se encuentran, en el diccionario metadata del item.
+    Devuelve lista de strings con los valores encontrados.
+    """
+    if isinstance(campos, str):
+        campos = [campos]
+
+    for campo in campos:
+        # 1. Buscar en secciones vivas del workflowitem
+        for sid, sval in (sections or {}).items():
+            if isinstance(sval, dict) and campo in sval:
+                arr = sval[campo]
+                valores = []
+                if isinstance(arr, list):
+                    for elem in arr:
+                        if isinstance(elem, dict) and elem.get("value") is not None:
+                            v = str(elem["value"]).strip()
+                            if v:
+                                valores.append(v)
+                        elif isinstance(elem, str) and elem.strip():
+                            valores.append(elem.strip())
+                elif isinstance(arr, dict) and arr.get("value") is not None:
+                    v = str(arr["value"]).strip()
+                    if v:
+                        valores.append(v)
+                elif isinstance(arr, str) and arr.strip():
+                    valores.append(arr.strip())
+
+                if valores:
+                    return valores
+
+        # 2. Respaldo en metadata de item (por si ya está indexado en /core/items/{uuid})
+        if metadata_item and campo in metadata_item:
+            arr = metadata_item[campo]
+            valores = []
+            if isinstance(arr, list):
+                for elem in arr:
+                    if isinstance(elem, dict) and elem.get("value") is not None:
+                        v = str(elem["value"]).strip()
+                        if v:
+                            valores.append(v)
+                    elif isinstance(elem, str) and elem.strip():
+                        valores.append(elem.strip())
+            elif isinstance(arr, dict) and arr.get("value") is not None:
+                v = str(arr["value"]).strip()
+                if v:
+                    valores.append(v)
+            elif isinstance(arr, str) and arr.strip():
+                valores.append(arr.strip())
+
+            if valores:
+                return valores
+
+    return []
+
+
 def extraer_objeto(obj: dict) -> dict:
     tipo = (obj.get("type") or "").lower()
     emb = obj.get("_embedded", {}) or {}
@@ -174,25 +231,29 @@ def extraer_objeto(obj: dict) -> dict:
         wfi = {}
 
     wf_id = str(wfi.get("id", ""))
+    if not wf_id:
+        links = obj.get("_links", {}) or {}
+        if "workflowitem" in links:
+            href = links["workflowitem"].get("href", "")
+            m = re.search(r"/workflowitems/(\d+)", href)
+            if m:
+                wf_id = m.group(1)
+
+    sections = wfi.get("sections", {}) or {}
     item = (wfi.get("_embedded", {}) or {}).get("item") or (emb.get("item") if not wfi else None) or {}
-
+    uuid = item.get("uuid") or item.get("id") or ""
     md = item.get("metadata", {}) or {}
-    titulo = ""
-    if md.get("dc.title"):
-        titulo = md["dc.title"][0].get("value", "")
 
-    autores = []
-    if md.get("dc.contributor.author"):
-        autores = [a.get("value", "").strip() for a in md["dc.contributor.author"] if a.get("value")]
+    titulos = extraer_campo_metadatos(sections, md, ["dc.title", "dc.title.alternative"])
+    titulo = titulos[0] if titulos else ""
 
-    resumen = ""
-    if md.get("dc.description.abstract"):
-        resumen = md["dc.description.abstract"][0].get("value", "")
+    autores = extraer_campo_metadatos(sections, md, ["dc.contributor.author", "dc.creator"])
 
-    uuid = item.get("uuid", "")
-    fecha = ""
-    if md.get("dc.date.issued"):
-        fecha = md["dc.date.issued"][0].get("value", "")
+    resumenes = extraer_campo_metadatos(sections, md, ["dc.description.abstract", "dc.description"])
+    resumen = resumenes[0] if resumenes else ""
+
+    fechas = extraer_campo_metadatos(sections, md, ["dc.date.issued", "dc.date"])
+    fecha = fechas[0] if fechas else ""
 
     return {
         "tipo_objeto": tipo,
@@ -210,56 +271,76 @@ def extraer_objeto(obj: dict) -> dict:
 
 
 def buscar_pooltask_id(client: httpx.Client, item_uuid: str) -> str:
+    if not item_uuid:
+        return ""
     try:
         r = client.get(f"{API}/workflow/pooltasks/search/findByItem", params={"uuid": item_uuid})
         if r.status_code == 200:
-            return str(r.json().get("id", ""))
+            data = r.json()
+            return str(data.get("id", ""))
     except Exception:
         pass
     return ""
 
 
 def buscar_claimedtask_id(client: httpx.Client, item_uuid: str) -> str:
+    if not item_uuid:
+        return ""
     try:
         r = client.get(f"{API}/workflow/claimedtasks/search/findByItem", params={"uuid": item_uuid})
         if r.status_code == 200:
-            return str(r.json().get("id", ""))
+            data = r.json()
+            return str(data.get("id", ""))
     except Exception:
         pass
     return ""
 
 
 def obtener_info_workflowitem(client: httpx.Client, wf_id: str) -> dict:
-    """Obtiene la información completa de un workflowitem por su ID."""
-    url = f"{API}/workflow/workflowitems/{wf_id}?embed=item&embed=item/bundles/bitstreams"
+    """Obtiene la información completa de un workflowitem por su ID,
+    extrayendo metadatos de sus secciones vivas y vinculando su item y tareas.
+    """
+    url = f"{API}/workflow/workflowitems/{wf_id}?embed=item"
     r = client.get(url)
     r.raise_for_status()
     data = r.json()
 
-    item = data.get("_embedded", {}).get("item", {}) or {}
-    uuid = item.get("uuid", "")
+    sections = data.get("sections", {}) or {}
+    item = (data.get("_embedded", {}) or {}).get("item", {}) or {}
+    uuid = item.get("uuid") or item.get("id") or ""
     md = item.get("metadata", {}) or {}
 
-    titulo = ""
-    if md.get("dc.title"):
-        titulo = md["dc.title"][0].get("value", "")
+    # Si aún no tenemos uuid, consultar el link del item asociado al workflowitem
+    if not uuid:
+        item_href = ((data.get("_links", {}) or {}).get("item", {}) or {}).get("href")
+        if not item_href:
+            item_href = f"{API}/workflow/workflowitems/{wf_id}/item"
+        try:
+            r_item = client.get(item_href)
+            if r_item.status_code == 200:
+                item_data = r_item.json()
+                uuid = item_data.get("uuid") or item_data.get("id") or ""
+                if not md:
+                    md = item_data.get("metadata", {}) or {}
+        except Exception as e:
+            print(f"  [DEBUG] Error consultando item de workflowitem {wf_id}: {e}", file=sys.stderr)
 
-    autores = []
-    if md.get("dc.contributor.author"):
-        autores = [a.get("value", "").strip() for a in md["dc.contributor.author"] if a.get("value")]
+    # Extraer metadatos desde sections (prioridad) o metadata del item
+    titulos = extraer_campo_metadatos(sections, md, ["dc.title", "dc.title.alternative"])
+    titulo = titulos[0] if titulos else ""
 
-    resumen = ""
-    if md.get("dc.description.abstract"):
-        resumen = md["dc.description.abstract"][0].get("value", "")
+    autores = extraer_campo_metadatos(sections, md, ["dc.contributor.author", "dc.creator"])
 
-    pool_id = buscar_pooltask_id(client, uuid)
+    resumenes = extraer_campo_metadatos(sections, md, ["dc.description.abstract", "dc.description"])
+    resumen = resumenes[0] if resumenes else ""
+
+    fechas = extraer_campo_metadatos(sections, md, ["dc.date.issued", "dc.date"])
+    fecha = fechas[0] if fechas else ""
+
+    pool_id = buscar_pooltask_id(client, uuid) if uuid else ""
     claimed_id = ""
-    if not pool_id:
+    if not pool_id and uuid:
         claimed_id = buscar_claimedtask_id(client, uuid)
-
-    fecha = ""
-    if md.get("dc.date.issued") and len(md["dc.date.issued"]) > 0:
-        fecha = md["dc.date.issued"][0].get("value", "")
 
     return {
         "tipo_objeto": "workflowitem",
@@ -649,11 +730,17 @@ def marcar_adjunto_no_corresponde(
             "path": f"/sections/{sid_resumen}/dc.description.abstract/0",
             "value": {"value": resumen_nuevo, "language": lang_resumen},
         })
-    else:
+    elif val_resumen is not None and isinstance(val_resumen, list):
         patch_ops.append({
             "op": "add",
             "path": f"/sections/{sid_resumen}/dc.description.abstract/-",
             "value": {"value": resumen_nuevo, "language": lang_resumen},
+        })
+    else:
+        patch_ops.append({
+            "op": "add",
+            "path": f"/sections/{sid_resumen}/dc.description.abstract",
+            "value": [{"value": resumen_nuevo, "language": lang_resumen}],
         })
 
     headers = _headers_con_csrf(client, {"Content-Type": "application/json"})
@@ -703,45 +790,59 @@ def aplicar_cambios_workflowitem(
 
     # 1. Título si cambió
     if titulo_nuevo and titulo_nuevo.strip() != titulo_actual.strip():
+        lang_t = val_titulo[0].get("language") if (val_titulo and len(val_titulo) > 0 and isinstance(val_titulo[0], dict)) else "es"
         if val_titulo and len(val_titulo) > 0:
             patch_ops.append({
                 "op": "replace",
                 "path": f"/sections/{sid_titulo}/dc.title/0",
-                "value": {"value": titulo_nuevo.strip()},
+                "value": {"value": titulo_nuevo.strip(), "language": lang_t or "es"},
+            })
+        elif val_titulo is not None and isinstance(val_titulo, list):
+            patch_ops.append({
+                "op": "add",
+                "path": f"/sections/{sid_titulo}/dc.title/-",
+                "value": {"value": titulo_nuevo.strip(), "language": "es"},
             })
         else:
             patch_ops.append({
                 "op": "add",
-                "path": f"/sections/{sid_titulo}/dc.title/-",
-                "value": {"value": titulo_nuevo.strip()},
+                "path": f"/sections/{sid_titulo}/dc.title",
+                "value": [{"value": titulo_nuevo.strip(), "language": "es"}],
             })
 
     # 2. Autores si cambiaron
     if autores_nuevos and autores_nuevos != autores_actuales:
-        cant_existente = len(val_autores) if val_autores else 0
-        cant_nueva = len(autores_nuevos)
-
-        for i in range(min(cant_existente, cant_nueva)):
+        if val_autores is None:
             patch_ops.append({
-                "op": "replace",
-                "path": f"/sections/{sid_autores}/dc.contributor.author/{i}",
-                "value": {"value": autores_nuevos[i]},
+                "op": "add",
+                "path": f"/sections/{sid_autores}/dc.contributor.author",
+                "value": [{"value": a} for a in autores_nuevos],
             })
+        else:
+            cant_existente = len(val_autores) if val_autores else 0
+            cant_nueva = len(autores_nuevos)
 
-        if cant_nueva > cant_existente:
-            for i in range(cant_existente, cant_nueva):
+            for i in range(min(cant_existente, cant_nueva)):
                 patch_ops.append({
-                    "op": "add",
-                    "path": f"/sections/{sid_autores}/dc.contributor.author/-",
+                    "op": "replace",
+                    "path": f"/sections/{sid_autores}/dc.contributor.author/{i}",
                     "value": {"value": autores_nuevos[i]},
                 })
 
-        if cant_existente > cant_nueva:
-            for i in reversed(range(cant_nueva, cant_existente)):
-                patch_ops.append({
-                    "op": "remove",
-                    "path": f"/sections/{sid_autores}/dc.contributor.author/{i}",
-                })
+            if cant_nueva > cant_existente:
+                for i in range(cant_existente, cant_nueva):
+                    patch_ops.append({
+                        "op": "add",
+                        "path": f"/sections/{sid_autores}/dc.contributor.author/-",
+                        "value": {"value": autores_nuevos[i]},
+                    })
+
+            if cant_existente > cant_nueva:
+                for i in reversed(range(cant_nueva, cant_existente)):
+                    patch_ops.append({
+                        "op": "remove",
+                        "path": f"/sections/{sid_autores}/dc.contributor.author/{i}",
+                    })
 
     # 3. Resumen: concatenar nota al final entre corchetes
     resumen_actual = ""
@@ -766,11 +867,17 @@ def aplicar_cambios_workflowitem(
                 "path": f"/sections/{sid_resumen}/dc.description.abstract/0",
                 "value": {"value": resumen_nuevo, "language": lang_resumen},
             })
-        else:
+        elif val_resumen is not None and isinstance(val_resumen, list):
             patch_ops.append({
                 "op": "add",
                 "path": f"/sections/{sid_resumen}/dc.description.abstract/-",
                 "value": {"value": resumen_nuevo, "language": lang_resumen},
+            })
+        else:
+            patch_ops.append({
+                "op": "add",
+                "path": f"/sections/{sid_resumen}/dc.description.abstract",
+                "value": [{"value": resumen_nuevo, "language": lang_resumen}],
             })
 
     if not patch_ops:
@@ -850,13 +957,27 @@ def procesar_flujo(
         print(f"[PROCESO] Cantidad de items a evaluar: {len(candidatos)}", file=sys.stderr)
 
         for idx, item in enumerate(candidatos, start=1):
-            uuid = item["item_uuid"]
-            wf_id = item["workflowitem_id"]
-            titulo_rdu = item["titulo"]
-            autores_rdu = item["autores"]
+            wf_id = item.get("workflowitem_id")
+            if not wf_id:
+                print(f"[SKIP] Objeto #{idx} sin workflowitem_id.", file=sys.stderr)
+                continue
+
+            # Traer SIEMPRE o enriquecer con los metadatos vivos y completos de RDU (sections, uuid, etc.)
+            try:
+                info_wfi = obtener_info_workflowitem(client, wf_id)
+                for k, v in info_wfi.items():
+                    if v or not item.get(k):
+                        item[k] = v
+            except Exception as e:
+                print(f"  [WARN] No se pudo obtener información ampliada de workflowitem {wf_id}: {e}", file=sys.stderr)
+
+            uuid = item.get("item_uuid", "")
+            titulo_rdu = item.get("titulo", "")
+            autores_rdu = item.get("autores", [])
 
             print(f"\n[PROCESANDO] #{idx} Item: {titulo_rdu[:70]}...")
             print(f"  Autores RDU: {autores_rdu}")
+            print(f"  UUID: {uuid or '(no encontrado)'} | Workflowitem: {wf_id}")
 
             # Descargar PDF y extraer texto (busca en upload sections y en bundles)
             texto_pdf, det_pdf = descargar_y_extraer_texto_pdf(client, wf_id, uuid)
