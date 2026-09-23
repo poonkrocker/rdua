@@ -6,6 +6,12 @@ Coteja y corrige automáticamente los autores (y el título) de los artículos e
 revisión en RDU (DSpace 7.6.5) contra el texto real del PDF adjunto, asistido por
 la API de DeepSeek.
 
+Permite:
+  A) Pegar el link específico de un artículo
+     (ej. https://rdu.unc.edu.ar/workflowitems/50076/edit o el ID 50076).
+  B) O pegar una URL de búsqueda de MyDSpace con filtros
+     (ej. .../mydspace?configuration=workflow&f.itemtype=article...).
+
 Flujo por cada ítem:
   1. Descarga el archivo del bundle ORIGINAL (PDF) por API REST de DSpace.
   2. Extrae el texto de las primeras páginas del PDF (donde están título y autores).
@@ -15,7 +21,7 @@ Flujo por cada ítem:
      - Corrige el título si tiene erratas o formato inadecuado.
      - Genera una síntesis breve de las modificaciones realizadas.
   4. Si hubo cambios:
-     - Asume la tarea en el workflow (POST /api/workflow/claimedtasks).
+     - Asume la tarea en el workflow si está en el pool (POST /api/workflow/claimedtasks).
      - Aplica los cambios vía JSON Patch:
          * Actualiza dc.contributor.author.
          * Actualiza dc.title si varió.
@@ -46,8 +52,7 @@ BASE_URL = os.environ.get("RDU_BASE_URL", "https://rdu.unc.edu.ar").rstrip("/")
 API = f"{BASE_URL}/server/api"
 
 DEFAULT_UI_URL = (
-    f"{BASE_URL}/mydspace?configuration=workflow&f.itemtype=article,equals"
-    "&spc.page=1&f.dateIssued.min=2014&f.dateIssued.max=2014"
+    f"{BASE_URL}/workflowitems/50076/edit"
 )
 
 IGNORAR_PARAMS = {"spc.page", "page", "size", "spc.sf", "spc.sd", "spc.rpp"}
@@ -205,6 +210,156 @@ def extraer_objeto(obj: dict) -> dict:
     }
 
 
+def buscar_pooltask_id(client: httpx.Client, item_uuid: str) -> str:
+    try:
+        r = client.get(f"{API}/workflow/pooltasks/search/findByItem", params={"uuid": item_uuid})
+        if r.status_code == 200:
+            return str(r.json().get("id", ""))
+    except Exception:
+        pass
+    return ""
+
+
+def buscar_claimedtask_id(client: httpx.Client, item_uuid: str) -> str:
+    try:
+        r = client.get(f"{API}/workflow/claimedtasks/search/findByItem", params={"uuid": item_uuid})
+        if r.status_code == 200:
+            return str(r.json().get("id", ""))
+    except Exception:
+        pass
+    return ""
+
+
+def obtener_info_workflowitem(client: httpx.Client, wf_id: str) -> dict:
+    """Obtiene la información completa de un workflowitem por su ID."""
+    url = f"{API}/workflow/workflowitems/{wf_id}?embed=item&embed=item/bundles/bitstreams"
+    r = client.get(url)
+    r.raise_for_status()
+    data = r.json()
+
+    item = data.get("_embedded", {}).get("item", {}) or {}
+    uuid = item.get("uuid", "")
+    md = item.get("metadata", {}) or {}
+
+    titulo = ""
+    if md.get("dc.title"):
+        titulo = md["dc.title"][0].get("value", "")
+
+    autores = []
+    if md.get("dc.contributor.author"):
+        autores = [a.get("value", "").strip() for a in md["dc.contributor.author"] if a.get("value")]
+
+    resumen = ""
+    if md.get("dc.description.abstract"):
+        resumen = md["dc.description.abstract"][0].get("value", "")
+
+    pool_id = buscar_pooltask_id(client, uuid)
+    claimed_id = ""
+    if not pool_id:
+        claimed_id = buscar_claimedtask_id(client, uuid)
+
+    fecha = ""
+    if md.get("dc.date.issued") and len(md["dc.date.issued"]) > 0:
+        fecha = md["dc.date.issued"][0].get("value", "")
+
+    return {
+        "tipo_objeto": "workflowitem",
+        "pooltask_id": pool_id,
+        "claimedtask_id": claimed_id,
+        "workflowitem_id": str(wf_id),
+        "item_uuid": uuid,
+        "titulo": titulo,
+        "autores": autores,
+        "resumen": resumen,
+        "fecha": fecha,
+        "link_workflow": f"{BASE_URL}/workflowitems/{wf_id}/edit",
+        "link_item": f"{BASE_URL}/items/{uuid}" if uuid else "",
+    }
+
+
+def resolver_candidatos(client: httpx.Client, entrada_url: str) -> list[dict]:
+    """Detecta si entrada_url es un ítem puntual (workflowitem/item) o una búsqueda de MyDSpace."""
+    entrada = entrada_url.strip()
+
+    # 1. Caso: Link o ID numérico de workflowitem (ej. https://rdu.unc.edu.ar/workflowitems/50076/edit o 50076)
+    m_wf = re.search(r"/workflowitems/(\d+)", entrada)
+    if not m_wf and entrada.isdigit():
+        wf_id = entrada
+    elif m_wf:
+        wf_id = m_wf.group(1)
+    else:
+        wf_id = None
+
+    if wf_id:
+        print(f"[MODO INDIVIDUAL] Detectado workflowitem específico con ID {wf_id}", file=sys.stderr)
+        try:
+            return [obtener_info_workflowitem(client, wf_id)]
+        except Exception as e:
+            sys.exit(f"[ERROR] No se pudo obtener el workflowitem {wf_id} de RDU: {e}")
+
+    # 2. Caso: Link o UUID de item (/items/<uuid>)
+    m_uuid = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", entrada, re.IGNORECASE)
+    if m_uuid and ("/items/" in entrada.lower() or len(entrada) == 36):
+        uuid_item = m_uuid.group(0)
+        print(f"[MODO INDIVIDUAL] Detectado UUID de item: {uuid_item}", file=sys.stderr)
+        pool_id = buscar_pooltask_id(client, uuid_item)
+        claimed_id = buscar_claimedtask_id(client, uuid_item)
+        wf_id = None
+        if pool_id:
+            r = client.get(f"{API}/workflow/pooltasks/{pool_id}?embed=workflowitem")
+            wf_id = r.json().get("_embedded", {}).get("workflowitem", {}).get("id")
+        elif claimed_id:
+            r = client.get(f"{API}/workflow/claimedtasks/{claimed_id}?embed=workflowitem")
+            wf_id = r.json().get("_embedded", {}).get("workflowitem", {}).get("id")
+
+        if wf_id:
+            return [obtener_info_workflowitem(client, str(wf_id))]
+        else:
+            sys.exit(f"[ERROR] No se encontró workflowitem activo para el item {uuid_item}.")
+
+    # 3. Caso: Búsqueda MyDSpace con filtros
+    params, rango_fechas = params_desde_url(entrada)
+    print(f"[MODO LOTE] Filtros interpretados: {json.dumps(params, ensure_ascii=False)}", file=sys.stderr)
+
+    candidatos = []
+    page = 0
+    page_size = 50
+
+    print("[BUSQUEDA] Consultando items en workflow...", file=sys.stderr)
+    while True:
+        p = dict(params)
+        p["size"] = [str(page_size)]
+        p["page"] = [str(page)]
+
+        data = get_json(client, f"{API}/discover/search/objects", params=p)
+        sr = data.get("_embedded", {}).get("searchResult", {})
+        objetos = sr.get("_embedded", {}).get("objects", [])
+        info = sr.get("page", {})
+
+        if page == 0:
+            print(
+                f"[BUSQUEDA] Total encontrados según servidor: {info.get('totalElements')} "
+                f"en {info.get('totalPages')} página(s)",
+                file=sys.stderr,
+            )
+
+        if not objetos:
+            break
+
+        for o in objetos:
+            io = o.get("_embedded", {}).get("indexableObject", {})
+            fila = extraer_objeto(io)
+            if pasa_filtro_fecha(fila, rango_fechas):
+                candidatos.append(fila)
+
+        page += 1
+        if page >= info.get("totalPages", 1):
+            break
+        time.sleep(0.2)
+
+    return candidatos
+
+
 def pasa_filtro_fecha(fila: dict, rango_fechas: dict) -> bool:
     rango = rango_fechas.get("dateIssued")
     if not rango:
@@ -222,9 +377,7 @@ def pasa_filtro_fecha(fila: dict, rango_fechas: dict) -> bool:
 
 
 def descargar_y_extraer_texto_pdf(client: httpx.Client, item_uuid: str) -> tuple[str, str]:
-    """Descarga el bitstream del bundle ORIGINAL y extrae texto de las primeras páginas.
-    Devuelve (texto_extraido, detalle).
-    """
+    """Descarga el bitstream del bundle ORIGINAL y extrae texto de las primeras páginas."""
     if not item_uuid:
         return "", "SIN UUID"
 
@@ -252,7 +405,7 @@ def descargar_y_extraer_texto_pdf(client: httpx.Client, item_uuid: str) -> tuple
             b_pdf = b
             break
     if not b_pdf:
-        b_pdf = bitstreams[0]  # intentar con el primero si no termina en .pdf
+        b_pdf = bitstreams[0]
 
     content_url = b_pdf.get("_links", {}).get("content", {}).get("href")
     if not content_url:
@@ -271,7 +424,7 @@ def descargar_y_extraer_texto_pdf(client: httpx.Client, item_uuid: str) -> tuple
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         texto = ""
-        for p in reader.pages[:3]:  # primeras 3 páginas
+        for p in reader.pages[:3]:
             texto += (p.extract_text() or "") + "\n"
         texto = texto.strip()
         if not texto:
@@ -282,7 +435,6 @@ def descargar_y_extraer_texto_pdf(client: httpx.Client, item_uuid: str) -> tuple
 
 
 def consultar_deepseek(client_ai: OpenAI, model: str, titulo_rdu: str, autores_rdu: list[str], texto_pdf: str) -> dict:
-    """Consulta a DeepSeek para comparar título y autores contra el PDF."""
     system_prompt = (
         "Sos un catalogador bibliográfico experto en el Repositorio Digital Universitario (RDU - Universidad Nacional de Córdoba, Argentina).\n"
         "Tu tarea es cotejar los metadatos cargados en RDU (Título y Autores) contra el texto real de las primeras páginas del documento adjunto (PDF).\n\n"
@@ -336,7 +488,6 @@ def consultar_deepseek(client_ai: OpenAI, model: str, titulo_rdu: str, autores_r
                 max_tokens=1000,
             )
             raw = (resp.choices[0].message.content or "").strip()
-            # Limpiar markdown de json si viene con ```json
             limpio = raw.replace("```json", "").replace("```", "").strip()
             m = re.search(r"\{.*\}", limpio, re.DOTALL)
             if m:
@@ -360,16 +511,6 @@ def asumir_tarea(client: httpx.Client, pooltask_id: str) -> str:
     return str(r.json().get("id", ""))
 
 
-def buscar_pooltask_id(client: httpx.Client, item_uuid: str) -> str:
-    try:
-        r = client.get(f"{API}/workflow/pooltasks/search/findByItem", params={"uuid": item_uuid})
-        if r.status_code == 200:
-            return str(r.json().get("id", ""))
-    except Exception:
-        pass
-    return ""
-
-
 def aplicar_cambios_workflowitem(
     client: httpx.Client,
     workflowitem_id: str,
@@ -379,9 +520,7 @@ def aplicar_cambios_workflowitem(
     autores_actuales: list[str],
     resumen_modificaciones: str,
 ) -> tuple[str, str, str]:
-    """Aplica las modificaciones vía JSON Patch en el workflowitem.
-    Devuelve (titulo_final, autores_finales_str, resumen_final).
-    """
+    """Aplica las modificaciones vía JSON Patch en el workflowitem."""
     url_wfi = f"{API}/workflow/workflowitems/{workflowitem_id}"
     r = client.get(url_wfi)
     r.raise_for_status()
@@ -389,7 +528,6 @@ def aplicar_cambios_workflowitem(
 
     sections = wfi_data.get("sections", {}) or {}
 
-    # Localizar secciones que contienen dc.title, dc.contributor.author y dc.description.abstract
     def _buscar_seccion(campo: str) -> tuple[str | None, list | None]:
         for sid, sval in sections.items():
             if isinstance(sval, dict) and campo in sval:
@@ -400,7 +538,6 @@ def aplicar_cambios_workflowitem(
     sid_autores, val_autores = _buscar_seccion("dc.contributor.author")
     sid_resumen, val_resumen = _buscar_seccion("dc.description.abstract")
 
-    # Si alguna no está, buscar tradicionalpageone o la primera
     sid_default = "traditionalpageone" if "traditionalpageone" in sections else (list(sections.keys())[0] if sections else None)
     if not sid_default:
         raise RuntimeError(f"Workflowitem {workflowitem_id} no tiene secciones reconocibles.")
@@ -431,7 +568,6 @@ def aplicar_cambios_workflowitem(
         cant_existente = len(val_autores) if val_autores else 0
         cant_nueva = len(autores_nuevos)
 
-        # Reemplazar elementos existentes
         for i in range(min(cant_existente, cant_nueva)):
             patch_ops.append({
                 "op": "replace",
@@ -439,7 +575,6 @@ def aplicar_cambios_workflowitem(
                 "value": {"value": autores_nuevos[i]},
             })
 
-        # Agregar elementos si hay más autores nuevos
         if cant_nueva > cant_existente:
             for i in range(cant_existente, cant_nueva):
                 patch_ops.append({
@@ -448,7 +583,6 @@ def aplicar_cambios_workflowitem(
                     "value": {"value": autores_nuevos[i]},
                 })
 
-        # Eliminar elementos sobrantes de atrás hacia adelante
         if cant_existente > cant_nueva:
             for i in reversed(range(cant_nueva, cant_existente)):
                 patch_ops.append({
@@ -465,7 +599,6 @@ def aplicar_cambios_workflowitem(
 
     nota_final = f"[{resumen_modificaciones.strip('[]')}]"
     if resumen_actual.strip():
-        # Verificar que no esté ya la nota exacta
         if nota_final not in resumen_actual:
             resumen_nuevo = f"{resumen_actual.strip()}\n\n{nota_final}"
         else:
@@ -529,8 +662,7 @@ def procesar_flujo(
 
     client_ai = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com")
 
-    params, rango_fechas = params_desde_url(ui_url)
-    print(f"[INICIO] Filtros interpretados: {json.dumps(params, ensure_ascii=False)}", file=sys.stderr)
+    print(f"[INICIO] Entrada: {ui_url}", file=sys.stderr)
     print(f"[INICIO] Modelo DeepSeek: {deepseek_model} | Dry-run: {dry_run} | Límite: {limite or 'Sin límite'}", file=sys.stderr)
 
     if not archivo_csv:
@@ -560,43 +692,9 @@ def procesar_flujo(
     with httpx.Client(timeout=60, headers=HEADERS_BASE, follow_redirects=True) as client:
         login(client, email, password)
 
-        candidatos = []
-        page = 0
-        page_size = 50
-
-        print("[BUSQUEDA] Consultando items en workflow...", file=sys.stderr)
-        while True:
-            p = dict(params)
-            p["size"] = [str(page_size)]
-            p["page"] = [str(page)]
-
-            data = get_json(client, f"{API}/discover/search/objects", params=p)
-            sr = data.get("_embedded", {}).get("searchResult", {})
-            objetos = sr.get("_embedded", {}).get("objects", [])
-            info = sr.get("page", {})
-
-            if page == 0:
-                print(
-                    f"[BUSQUEDA] Total encontrados según servidor: {info.get('totalElements')} "
-                    f"en {info.get('totalPages')} página(s)",
-                    file=sys.stderr,
-                )
-
-            if not objetos:
-                break
-
-            for o in objetos:
-                io = o.get("_embedded", {}).get("indexableObject", {})
-                fila = extraer_objeto(io)
-                if pasa_filtro_fecha(fila, rango_fechas):
-                    candidatos.append(fila)
-
-            page += 1
-            if page >= info.get("totalPages", 1):
-                break
-            time.sleep(0.2)
-
-        print(f"[BUSQUEDA] Total candidatos tras filtro de fecha: {len(candidatos)}", file=sys.stderr)
+        # Resuelve si es link individual o búsqueda en lote
+        candidatos = resolver_candidatos(client, ui_url)
+        print(f"[PROCESO] Cantidad de items a evaluar: {len(candidatos)}", file=sys.stderr)
 
         for idx, item in enumerate(candidatos, start=1):
             uuid = item["item_uuid"]
@@ -624,6 +722,7 @@ def procesar_flujo(
                     "Link_Workflow": item["link_workflow"],
                     "Link_Item": item["link_item"],
                 })
+                conteo_errores += 1
                 continue
 
             # Cotejar con DeepSeek
@@ -739,7 +838,7 @@ def procesar_flujo(
             time.sleep(pausa_segundos)
 
             if limite > 0 and conteo_modificados >= limite:
-                print(f"\n[LIMITE] Se alcanzó el límite de {limite} ítem(s) modificados. Finalizando.")
+                print(f"\n[LIMITE] Se alcanzó el límite de {limite} ítem(s) procesados. Finalizando.")
                 break
 
     os.makedirs(os.path.dirname(archivo_csv) or ".", exist_ok=True)
@@ -759,7 +858,7 @@ def procesar_flujo(
 
 def main():
     parser = argparse.ArgumentParser(description="Corrige autores y título en RDU a partir del PDF con DeepSeek.")
-    parser.add_argument("--url", default=os.environ.get("RDU_UI_URL", DEFAULT_UI_URL), help="URL de MyDSpace con filtros")
+    parser.add_argument("--url", default=os.environ.get("RDU_UI_URL", DEFAULT_UI_URL), help="URL de MyDSpace o link específico de workflowitem")
     parser.add_argument("--dry-run", action="store_true", default=os.environ.get("DRY_RUN", "0") in ("1", "true", "True"), help="Modo simulación sin escribir en RDU")
     parser.add_argument("--limite", type=int, default=int(os.environ.get("LIMITE", "0")), help="Límite de ítems a modificar (0 = sin límite)")
     parser.add_argument("--model", default=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"), help="Modelo de DeepSeek (default deepseek-chat)")

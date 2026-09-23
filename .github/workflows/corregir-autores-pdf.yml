@@ -4,16 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       ui_url:
-        description: "URL de MyDSpace con los filtros"
+        description: "Pega el link específico (ej. https://rdu.unc.edu.ar/workflowitems/50076/edit) O URL de MyDSpace con filtros"
         required: true
-        default: "https://rdu.unc.edu.ar/mydspace?configuration=workflow&f.itemtype=article,equals&spc.page=1&f.dateIssued.min=2014&f.dateIssued.max=2014"
+        default: "https://rdu.unc.edu.ar/workflowitems/50076/edit"
       dry_run:
-        description: "Modo simulación (true = NO escribe en RDU, solo genera reporte)"
+        description: "Modo simulación (true = NO escribe en RDU, solo genera reporte de prueba)"
         type: boolean
         required: true
         default: true
       limite:
-        description: "Límite de ítems a modificar (0 = sin límite, o ej. 1 o 2 para probar)"
+        description: "Límite de ítems (para link específico no aplica, para lote puedes poner ej. 1 o 5)"
         required: false
         default: "1"
       deepseek_model:
@@ -27,7 +27,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Configurar Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
