@@ -599,6 +599,68 @@ def descargar_y_extraer_texto_pdf(client: httpx.Client, wf_id: str, item_uuid: s
         return "", f"ERROR AL PARSEAR PDF: {e}"
 
 
+def es_token_inicial_secundaria(token: str) -> bool:
+    """Detecta si un token posterior al primer nombre es una inicial suelta o tanda de iniciales
+    (ej: 'B.', 'B', 'M.', 'E.', 'MB', 'J.C.').
+    """
+    tok = token.strip(".,;:()")
+    if not tok:
+        return True
+    if len(tok) == 1:
+        return True
+    # Iniciales pegadas sin vocales (ej: 'MB', 'Rm')
+    if len(tok) <= 3 and not any(c.lower() in "aeiouáéíóúü" for c in tok):
+        return True
+    # Iniciales con puntos múltiples (ej: 'J.C' o 'M.E')
+    partes = [p for p in re.split(r"\.+", token) if p]
+    if partes and all(len(p) == 1 for p in partes):
+        return True
+    return False
+
+
+def depurar_autor_sin_iniciales(autor: str) -> str:
+    """Asegura que el autor tenga formato estrictamente 'Apellido, Nombre' eliminando
+    iniciales secundarias/intermedias (ej: 'Suárez, Andrea B.' -> 'Suárez, Andrea').
+    """
+    s = (autor or "").strip()
+    if not s or "," not in s:
+        return s
+
+    partes = s.split(",", 1)
+    apellido = partes[0].strip()
+    resto = partes[1].strip()
+
+    tokens = resto.split()
+    if not tokens:
+        return f"{apellido},"
+
+    # Conservar el primer token (nombre de pila)
+    conservados = [tokens[0]]
+    # Filtrar tokens posteriores descartando iniciales secundarias
+    for tok in tokens[1:]:
+        if es_token_inicial_secundaria(tok):
+            continue
+        conservados.append(tok)
+
+    nombres = " ".join(conservados)
+    return f"{apellido}, {nombres}".strip()
+
+
+def son_autores_equivalentes(autores_a: list[str], autores_b: list[str]) -> bool:
+    """Verifica si dos listas de autores representan exactamente a las mismas personas
+    ignorando iniciales secundarias (ej: 'Suárez, Andrea' y 'Suárez, Andrea B.').
+    """
+    if len(autores_a) != len(autores_b):
+        return False
+
+    for a, b in zip(autores_a, autores_b):
+        limpio_a = depurar_autor_sin_iniciales(a).strip().lower()
+        limpio_b = depurar_autor_sin_iniciales(b).strip().lower()
+        if limpio_a != limpio_b:
+            return False
+    return True
+
+
 def consultar_deepseek(client_ai: OpenAI, model: str, titulo_rdu: str, autores_rdu: list[str], texto_pdf: str) -> dict:
     """Evalúa si el PDF corresponde al artículo registrado y propone correcciones o marca de discrepancia."""
     system_prompt = (
@@ -615,14 +677,19 @@ def consultar_deepseek(client_ai: OpenAI, model: str, titulo_rdu: str, autores_r
         "1. TÍTULO:\n"
         "   - Corrige erratas evidentes o mayúsculas sostenidas a sentence case.\n"
         "   - Si ya es correcto, consérvalo tal cual.\n\n"
-        "2. AUTORES:\n"
-        "   - Identifica a TODOS los autores reales según figuran en el PDF.\n"
-        "   - Contrasta con los autores de RDU: agrega los faltantes respetando el orden, completa nombres abreviados, corrige orden.\n"
-        "   - Formato obligatorio para cada autor: 'Apellido, Nombre' (o 'Apellido, Nombre1 Nombre2').\n\n"
+        "2. REGLA ESTRICTA PARA AUTORES:\n"
+        "   - Formato OBLIGATORIO: SOLO 'Apellido, Nombre' (para que coincida con el registro institucional de filiaciones en Sheets).\n"
+        "   - NUNCA agregues iniciales intermedias o secundarias (ej: si en el PDF dice 'Suárez, Andrea B.', debe quedar 'Suárez, Andrea'; si dice 'Mustaca, Alba E.', debe quedar 'Mustaca, Alba'). No incluyas iniciales sueltas como 'B.', 'E.', 'M.', etc.\n"
+        "   - NO MODIFICAR AUTORES QUE YA COINCIDEN: Si los autores registrados en RDU ya corresponden a los del PDF y la única diferencia es que el PDF trae iniciales intermedias (ej: RDU tiene 'Suárez, Andrea' y el PDF tiene 'Suárez, Andrea B.'), NO DEBES MODIFICARLOS. Mantén exactamente los autores de RDU y reporta que NO hubo cambios de autores.\n"
+        "   - Solo modifica autores si:\n"
+        "     * Falta un autor en RDU que sí está en el PDF (agrégalo respetando el orden, formato 'Apellido, Nombre' sin iniciales secundarias).\n"
+        "     * En RDU el nombre de pila está solo como inicial y en el PDF figura completo (ej: 'Abate, P.' en RDU -> 'Abate, Paula' según PDF).\n"
+        "     * El orden de los autores en RDU está invertido respecto al PDF.\n"
+        "     * Hay una errata ortográfica evidente en el apellido o nombre.\n\n"
         "3. RESUMEN DE MODIFICACIONES:\n"
-        "   - Si realizas cambios en título o autores, redacta una nota BREVE y precisa.\n"
+        "   - Si realizas cambios efectivos en título o autores, redacta una nota BREVE y precisa.\n"
         "     Ejemplo: 'Modificaciones: se completó el nombre de Abate, P. a Abate, Paula; se agregó autor Gómez, María'\n"
-        "   - Si no hubo cambios, deja cadena vacía.\n\n"
+        "   - Si no hubo cambios reales, deja cadena vacía y marca 'hubo_cambios': false.\n\n"
         "FORMATO DE RESPUESTA OBLIGATORIO (JSON ESTRICTO):\n"
         "{\n"
         '  "adjunto_corresponde": true o false,\n'
@@ -658,9 +725,13 @@ def consultar_deepseek(client_ai: OpenAI, model: str, titulo_rdu: str, autores_r
             raw = (resp.choices[0].message.content or "").strip()
             limpio = raw.replace("```json", "").replace("```", "").strip()
             m = re.search(r"\{.*\}", limpio, re.DOTALL)
-            if m:
-                return json.loads(m.group(0))
-            return json.loads(limpio)
+            res_dict = json.loads(m.group(0)) if m else json.loads(limpio)
+            if isinstance(res_dict, dict) and "autores_corregidos" in res_dict:
+                # Depurar autores devueltos para quitar iniciales secundarias
+                res_dict["autores_corregidos"] = [
+                    depurar_autor_sin_iniciales(a) for a in (res_dict.get("autores_corregidos") or []) if a
+                ]
+            return res_dict
         except Exception as e:
             print(f"  [WARN] Falló llamada a DeepSeek (intento {intento}/3): {e}", file=sys.stderr)
             time.sleep(2 * intento)
@@ -1084,8 +1155,27 @@ def procesar_flujo(
                 continue
 
             # CASO B: EL ADJUNTO SÍ CORRESPONDE AL ARTÍCULO
-            if not analisis.get("hubo_cambios"):
-                print("  [OK] DeepSeek determinó que el documento coincide y NO se requieren modificaciones.")
+            # 1. Depurar autores propuestos: estrictamente SOLO 'Apellido, Nombre' sin iniciales secundarias
+            autores_propuestos_crudos = analisis.get("autores_corregidos") or autores_rdu
+            autores_propuestos = [depurar_autor_sin_iniciales(a) for a in autores_propuestos_crudos]
+
+            # 2. Si los autores propuestos coinciden con los de RDU (la única diferencia eran iniciales intermedias),
+            # NO modificarlos: conservar exactamente los de RDU.
+            if son_autores_equivalentes(autores_rdu, autores_propuestos):
+                autores_nuevos = list(autores_rdu)
+                cambio_autores = False
+            else:
+                autores_nuevos = autores_propuestos
+                cambio_autores = (autores_nuevos != autores_rdu)
+
+            # 3. Título corregido
+            titulo_nuevo = (analisis.get("titulo_corregido") or titulo_rdu).strip()
+            cambio_titulo = (titulo_nuevo != titulo_rdu.strip())
+
+            # 4. Determinar si realmente existen cambios efectivos
+            hay_cambios = cambio_titulo or cambio_autores
+            if not hay_cambios:
+                print("  [OK] DeepSeek y validación determinaron que los metadatos coinciden (sin iniciales extra) y NO se requieren modificaciones.")
                 filas_reporte.append({
                     "Fecha": datetime.now().isoformat(),
                     "Workflowitem_ID": wf_id,
@@ -1094,7 +1184,7 @@ def procesar_flujo(
                     "Titulo_Nuevo": titulo_rdu,
                     "Autores_Anteriores": "; ".join(autores_rdu),
                     "Autores_Nuevos": "; ".join(autores_rdu),
-                    "Modificaciones": "Sin cambios requeridos",
+                    "Modificaciones": "Sin cambios requeridos (metadatos coincidentes)",
                     "Accion": "SIN_CAMBIOS",
                     "Link_Workflow": item["link_workflow"],
                     "Link_Item": item["link_item"],
@@ -1102,14 +1192,20 @@ def procesar_flujo(
                 conteo_sin_cambios += 1
                 continue
 
-            titulo_nuevo = analisis.get("titulo_corregido") or titulo_rdu
-            autores_nuevos = analisis.get("autores_corregidos") or autores_rdu
-            modificaciones = analisis.get("resumen_modificaciones") or "Modificaciones según PDF"
+            # Construir resumen de modificaciones conciso y preciso
+            if cambio_titulo and not cambio_autores:
+                modificaciones = "Modificaciones: se corrigió el título según PDF"
+            elif cambio_autores and not cambio_titulo:
+                modificaciones = analisis.get("resumen_modificaciones") or "Modificaciones en autores según PDF"
+                if "inicial" in modificaciones.lower() and not any(es_token_inicial_secundaria(tok) for a in autores_nuevos for tok in a.split()[1:]):
+                    modificaciones = "Modificaciones: autores actualizados según PDF"
+            else:
+                modificaciones = analisis.get("resumen_modificaciones") or "Modificaciones en título y autores según PDF"
 
             print(f"  [CAMBIOS DETECTADOS]: {modificaciones}")
-            if titulo_nuevo != titulo_rdu:
+            if cambio_titulo:
                 print(f"    - Título: {titulo_rdu} -> {titulo_nuevo}")
-            if autores_nuevos != autores_rdu:
+            if cambio_autores:
                 print(f"    - Autores: {autores_rdu} -> {autores_nuevos}")
 
             if dry_run:
