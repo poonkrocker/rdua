@@ -66,6 +66,16 @@ except ImportError:
         limpiar_descripcion,
     )
 
+# Importar cliente de Google Sheets
+try:
+    import sheets_client as sc
+except ImportError:
+    try:
+        sys.path.append(os.path.dirname(__file__))
+        import sheets_client as sc
+    except ImportError:
+        sc = None
+
 BASE_URL = os.environ.get("RDU_BASE_URL", "https://rdu.unc.edu.ar").rstrip("/")
 API = f"{BASE_URL}/server/api"
 
@@ -1001,7 +1011,10 @@ def devolver_tarea_al_pool(client: httpx.Client, claimedtask_id: str):
 
 
 def procesar_flujo(
-    ui_url: str,
+    ui_url: str = "",
+    origen: str = "cola",
+    google_sheet_id: str = "",
+    reprocesar_todo: bool = False,
     dry_run: bool = False,
     limite: int = 0,
     pausa_segundos: float = 0.5,
@@ -1016,8 +1029,7 @@ def procesar_flujo(
 
     client_ai = OpenAI(api_key=deepseek_key, base_url="https://api.deepseek.com")
 
-    print(f"[INICIO] Entrada: {ui_url}", file=sys.stderr)
-    print(f"[INICIO] Modelo DeepSeek: {deepseek_model} | Dry-run: {dry_run} | Límite: {limite or 'Sin límite'}", file=sys.stderr)
+    print(f"[INICIO] Origen: {origen} | Modelo DeepSeek: {deepseek_model} | Dry-run: {dry_run} | Límite: {limite or 'Sin límite'}", file=sys.stderr)
 
     if not archivo_csv:
         os.makedirs("reportes", exist_ok=True)
@@ -1043,17 +1055,107 @@ def procesar_flujo(
     conteo_sin_cambios = 0
     conteo_errores = 0
 
+    ws_cola = None
+    sc_mod = None
+    if origen == "cola":
+        if not os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
+            sys.exit("[ERROR] Falta GOOGLE_SERVICE_ACCOUNT_JSON en el entorno o en los secrets de GitHub para acceder a Google Sheets.")
+
+        sid = google_sheet_id or os.environ.get("GOOGLE_SHEET_ID") or "1gh2n-gbxiSzrCQZG4-Pkq52eMmbLzJiGnb_6vP4zEQU"
+        os.environ["GOOGLE_SHEET_ID"] = sid
+
+        if sc is None:
+            sys.path.append(os.path.dirname(__file__))
+            import sheets_client as sc_mod
+        else:
+            sc_mod = sc
+
+        print(f"[INICIO MODO COLA] Consultando Google Sheet ID: {sid} | Pestaña 'Cola'...", file=sys.stderr)
+        pendientes_cola, ws_cola = sc_mod.obtener_pendientes_revision_cola(
+            tope=limite if limite > 0 else None,
+            reprocesar_todo=reprocesar_todo,
+            sheet_id=sid,
+        )
+        print(f"[MODO COLA] Cantidad de filas a revisar en 'Cola': {len(pendientes_cola)}", file=sys.stderr)
+        if not pendientes_cola:
+            print("[INFO] No hay ítems pendientes de revisión en la hoja 'Cola' (las filas ya tienen resultado en Columna C).")
+            return
+
     with httpx.Client(timeout=60, headers=HEADERS_BASE, follow_redirects=True) as client:
         login(client, email, password)
 
-        # Resuelve si es link individual o búsqueda en lote
-        candidatos = resolver_candidatos(client, ui_url)
-        print(f"[PROCESO] Cantidad de items a evaluar: {len(candidatos)}", file=sys.stderr)
+        if origen == "cola":
+            trabajos = [{"link": p["link"], "row_index": p["row_index"]} for p in pendientes_cola]
+        else:
+            candidatos = resolver_candidatos(client, ui_url or DEFAULT_UI_URL)
+            print(f"[MODO URL] Cantidad de items a evaluar: {len(candidatos)}", file=sys.stderr)
+            trabajos = [{"candidato": c, "link": c.get("link_workflow") or ui_url, "row_index": None} for c in candidatos]
 
-        for idx, item in enumerate(candidatos, start=1):
+        for idx, trabajo in enumerate(trabajos, start=1):
+            row_idx = trabajo.get("row_index")
+            link_origen = trabajo.get("link", "")
+
+            def reportar_col_c(texto: str):
+                if ws_cola and row_idx and sc_mod:
+                    try:
+                        sc_mod.marcar_modificaciones_cola(ws_cola, row_idx, texto)
+                        print(f"  [COLA] Fila {row_idx} -> Col C: {texto}")
+                    except Exception as ex_c:
+                        print(f"  [WARN] No se pudo escribir en Col C de Google Sheets (fila {row_idx}): {ex_c}", file=sys.stderr)
+
+            if origen == "cola":
+                print(f"\n[PROCESANDO COLA #{idx}/{len(trabajos)} (Fila {row_idx})] Link: {link_origen}")
+                try:
+                    cands = resolver_candidatos(client, link_origen)
+                except Exception as e:
+                    err_msg = f"ERROR: No se pudo resolver link {link_origen}: {e}"
+                    print(f"  [ERROR] {err_msg}", file=sys.stderr)
+                    reportar_col_c(err_msg)
+                    filas_reporte.append({
+                        "Fecha": datetime.now().isoformat(),
+                        "Workflowitem_ID": "",
+                        "Item_UUID": "",
+                        "Titulo_Anterior": "",
+                        "Titulo_Nuevo": "",
+                        "Autores_Anteriores": "",
+                        "Autores_Nuevos": "",
+                        "Modificaciones": err_msg,
+                        "Accion": "ERROR",
+                        "Link_Workflow": link_origen,
+                        "Link_Item": "",
+                    })
+                    conteo_errores += 1
+                    continue
+
+                if not cands:
+                    err_msg = f"ERROR: No se encontró workflowitem activo para {link_origen}"
+                    print(f"  [ERROR] {err_msg}", file=sys.stderr)
+                    reportar_col_c(err_msg)
+                    filas_reporte.append({
+                        "Fecha": datetime.now().isoformat(),
+                        "Workflowitem_ID": "",
+                        "Item_UUID": "",
+                        "Titulo_Anterior": "",
+                        "Titulo_Nuevo": "",
+                        "Autores_Anteriores": "",
+                        "Autores_Nuevos": "",
+                        "Modificaciones": err_msg,
+                        "Accion": "ERROR",
+                        "Link_Workflow": link_origen,
+                        "Link_Item": "",
+                    })
+                    conteo_errores += 1
+                    continue
+
+                item = cands[0]
+            else:
+                item = trabajo["candidato"]
+
             wf_id = item.get("workflowitem_id")
             if not wf_id:
                 print(f"[SKIP] Objeto #{idx} sin workflowitem_id.", file=sys.stderr)
+                if row_idx:
+                    reportar_col_c("ERROR: Sin workflowitem_id")
                 continue
 
             # Traer SIEMPRE o enriquecer con los metadatos vivos y completos de RDU (sections, uuid, etc.)
@@ -1077,6 +1179,7 @@ def procesar_flujo(
             texto_pdf, det_pdf = descargar_y_extraer_texto_pdf(client, wf_id, uuid)
             if not texto_pdf:
                 print(f"  [OMITIDO] No se pudo extraer texto del PDF: {det_pdf}")
+                reportar_col_c(f"OMITIDO: {det_pdf}")
                 filas_reporte.append({
                     "Fecha": datetime.now().isoformat(),
                     "Workflowitem_ID": wf_id,
@@ -1087,8 +1190,8 @@ def procesar_flujo(
                     "Autores_Nuevos": "; ".join(autores_rdu),
                     "Modificaciones": det_pdf,
                     "Accion": f"OMITIDO: {det_pdf}",
-                    "Link_Workflow": item["link_workflow"],
-                    "Link_Item": item["link_item"],
+                    "Link_Workflow": item.get("link_workflow") or link_origen,
+                    "Link_Item": item.get("link_item") or "",
                 })
                 conteo_errores += 1
                 continue
@@ -1105,6 +1208,7 @@ def procesar_flujo(
 
                 if dry_run:
                     print("  [SIMULACIÓN] Se agregaría '[ADJUNTO NO CORRESPONDE]' al inicio del Resumen sin modificar autores/título.")
+                    reportar_col_c(f"[SIMULACIÓN] [ADJUNTO NO CORRESPONDE] {motivo}")
                     filas_reporte.append({
                         "Fecha": datetime.now().isoformat(),
                         "Workflowitem_ID": wf_id,
@@ -1115,8 +1219,8 @@ def procesar_flujo(
                         "Autores_Nuevos": "; ".join(autores_rdu),
                         "Modificaciones": motivo,
                         "Accion": "SIMULADO_ADJUNTO_NO_CORRESPONDE",
-                        "Link_Workflow": item["link_workflow"],
-                        "Link_Item": item["link_item"],
+                        "Link_Workflow": item.get("link_workflow") or link_origen,
+                        "Link_Item": item.get("link_item") or "",
                     })
                     conteo_modificados += 1
                 else:
@@ -1140,6 +1244,7 @@ def procesar_flujo(
                         devolver_tarea_al_pool(client, claimed_id)
                         print(f"  [3/3] Tarea devuelta al pool general.")
 
+                        reportar_col_c(f"[ADJUNTO NO CORRESPONDE] {motivo}")
                         filas_reporte.append({
                             "Fecha": datetime.now().isoformat(),
                             "Workflowitem_ID": wf_id,
@@ -1150,13 +1255,14 @@ def procesar_flujo(
                             "Autores_Nuevos": "; ".join(autores_rdu),
                             "Modificaciones": motivo,
                             "Accion": "MARCADO_ADJUNTO_NO_CORRESPONDE",
-                            "Link_Workflow": item["link_workflow"],
-                            "Link_Item": item["link_item"],
+                            "Link_Workflow": item.get("link_workflow") or link_origen,
+                            "Link_Item": item.get("link_item") or "",
                         })
                         conteo_modificados += 1
                     except Exception as e:
                         conteo_errores += 1
                         print(f"  [ERROR] Falló al marcar {wf_id}: {e}", file=sys.stderr)
+                        reportar_col_c(f"ERROR: {e}")
                         filas_reporte.append({
                             "Fecha": datetime.now().isoformat(),
                             "Workflowitem_ID": wf_id,
@@ -1167,8 +1273,8 @@ def procesar_flujo(
                             "Autores_Nuevos": "; ".join(autores_rdu),
                             "Modificaciones": f"ERROR: {e}",
                             "Accion": "ERROR",
-                            "Link_Workflow": item["link_workflow"],
-                            "Link_Item": item["link_item"],
+                            "Link_Workflow": item.get("link_workflow") or link_origen,
+                            "Link_Item": item.get("link_item") or "",
                         })
 
                 time.sleep(pausa_segundos)
@@ -1217,6 +1323,7 @@ def procesar_flujo(
             hay_cambios = cambio_titulo or cambio_autores
             if not hay_cambios:
                 print("  [OK] DeepSeek y validación determinaron que los metadatos coinciden (sin iniciales extra, formato RDU ' : ') y NO se requieren modificaciones.")
+                reportar_col_c("Sin cambios requeridos (metadatos coincidentes)")
                 filas_reporte.append({
                     "Fecha": datetime.now().isoformat(),
                     "Workflowitem_ID": wf_id,
@@ -1227,8 +1334,8 @@ def procesar_flujo(
                     "Autores_Nuevos": "; ".join(autores_rdu),
                     "Modificaciones": "Sin cambios requeridos (metadatos coincidentes)",
                     "Accion": "SIN_CAMBIOS",
-                    "Link_Workflow": item["link_workflow"],
-                    "Link_Item": item["link_item"],
+                    "Link_Workflow": item.get("link_workflow") or link_origen,
+                    "Link_Item": item.get("link_item") or "",
                 })
                 conteo_sin_cambios += 1
                 continue
@@ -1258,6 +1365,7 @@ def procesar_flujo(
 
             if dry_run:
                 print("  [SIMULACIÓN] No se escriben cambios en RDU (dry-run activo).")
+                reportar_col_c(f"[SIMULACIÓN] {modificaciones}")
                 filas_reporte.append({
                     "Fecha": datetime.now().isoformat(),
                     "Workflowitem_ID": wf_id,
@@ -1268,8 +1376,8 @@ def procesar_flujo(
                     "Autores_Nuevos": "; ".join(autores_nuevos),
                     "Modificaciones": modificaciones,
                     "Accion": "SIMULADO_CORREGIDO",
-                    "Link_Workflow": item["link_workflow"],
-                    "Link_Item": item["link_item"],
+                    "Link_Workflow": item.get("link_workflow") or link_origen,
+                    "Link_Item": item.get("link_item") or "",
                 })
                 conteo_modificados += 1
             else:
@@ -1302,6 +1410,7 @@ def procesar_flujo(
                     devolver_tarea_al_pool(client, claimed_id)
                     print("  [3/3] Tarea devuelta al pool general.")
 
+                    reportar_col_c(modificaciones)
                     filas_reporte.append({
                         "Fecha": datetime.now().isoformat(),
                         "Workflowitem_ID": wf_id,
@@ -1312,14 +1421,15 @@ def procesar_flujo(
                         "Autores_Nuevos": a_fin,
                         "Modificaciones": modificaciones,
                         "Accion": "MODIFICADO_Y_DEVUELTO_AL_POOL",
-                        "Link_Workflow": item["link_workflow"],
-                        "Link_Item": item["link_item"],
+                        "Link_Workflow": item.get("link_workflow") or link_origen,
+                        "Link_Item": item.get("link_item") or "",
                     })
                     conteo_modificados += 1
 
                 except Exception as e:
                     conteo_errores += 1
                     print(f"  [ERROR] Falló la actualización de {wf_id}: {e}", file=sys.stderr)
+                    reportar_col_c(f"ERROR: {e}")
                     filas_reporte.append({
                         "Fecha": datetime.now().isoformat(),
                         "Workflowitem_ID": wf_id,
@@ -1330,8 +1440,8 @@ def procesar_flujo(
                         "Autores_Nuevos": "; ".join(autores_nuevos),
                         "Modificaciones": f"ERROR: {e}",
                         "Accion": "ERROR",
-                        "Link_Workflow": item["link_workflow"],
-                        "Link_Item": item["link_item"],
+                        "Link_Workflow": item.get("link_workflow") or link_origen,
+                        "Link_Item": item.get("link_item") or "",
                     })
 
             time.sleep(pausa_segundos)
@@ -1357,13 +1467,21 @@ def procesar_flujo(
 
 def main():
     parser = argparse.ArgumentParser(description="Corrige autores y título en RDU a partir del PDF con DeepSeek.")
-    parser.add_argument("--url", default=os.environ.get("RDU_UI_URL", DEFAULT_UI_URL), help="URL de MyDSpace o link específico de workflowitem")
+    parser.add_argument("--origen", choices=["cola", "url"], default=os.environ.get("MODO_ORIGEN", "cola"), help="Origen: 'cola' (Google Sheets) o 'url' (enlace directo)")
+    parser.add_argument("--url", default=os.environ.get("RDU_UI_URL", ""), help="URL de MyDSpace o link específico de workflowitem")
+    parser.add_argument("--sheet-id", default=os.environ.get("GOOGLE_SHEET_ID", "1gh2n-gbxiSzrCQZG4-Pkq52eMmbLzJiGnb_6vP4zEQU"), help="ID del spreadsheet de Google Sheets")
+    parser.add_argument("--reprocesar-todo", action="store_true", default=os.environ.get("REPROCESAR_TODO", "0") in ("1", "true", "True"), help="Reprocesar filas de la cola aunque ya tengan contenido en la Columna C")
     parser.add_argument("--dry-run", action="store_true", default=os.environ.get("DRY_RUN", "0") in ("1", "true", "True"), help="Modo simulación sin escribir en RDU")
-    parser.add_argument("--limite", type=int, default=int(os.environ.get("LIMITE", "0")), help="Límite de ítems a modificar (0 = sin límite)")
+    parser.add_argument("--limite", type=int, default=int(os.environ.get("LIMITE", "0")), help="Límite de ítems a procesar (0 = sin límite)")
     parser.add_argument("--model", default=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"), help="Modelo de DeepSeek (default deepseek-chat)")
     parser.add_argument("--output", default=os.environ.get("ARCHIVO_REPORTE", ""), help="Ruta del CSV de salida")
 
     args = parser.parse_args()
+
+    # Si se especificó una URL explícita por CLI/env y no se forzó origen 'cola', cambiar a 'url'
+    origen = args.origen
+    if args.url and args.url.strip() and args.url != "cola" and "--origen" not in sys.argv and os.environ.get("MODO_ORIGEN") != "cola":
+        origen = "url"
 
     email = os.environ.get("RDU_EMAIL") or os.environ.get("RDU_USER") or ""
     password = os.environ.get("RDU_PASSWORD") or os.environ.get("RDU_PASS") or ""
@@ -1371,6 +1489,9 @@ def main():
 
     procesar_flujo(
         ui_url=args.url,
+        origen=origen,
+        google_sheet_id=args.sheet_id,
+        reprocesar_todo=args.reprocesar_todo,
         dry_run=args.dry_run,
         limite=args.limite,
         email=email,

@@ -3,19 +3,32 @@ name: Corregir autores y título desde PDF (DeepSeek)
 on:
   workflow_dispatch:
     inputs:
-      ui_url:
-        description: "Pega el link específico (ej. https://rdu.unc.edu.ar/workflowitems/50076/edit) O URL de MyDSpace con filtros"
+      origen:
+        description: "Origen de los ítems a procesar"
+        type: choice
+        options:
+          - "cola"
+          - "url"
+        default: "cola"
         required: true
+      ui_url:
+        description: "Si elegiste origen 'url': pega el link específico o URL de MyDSpace"
+        required: false
         default: "https://rdu.unc.edu.ar/workflowitems/50076/edit"
       dry_run:
-        description: "Modo simulación (true = NO escribe en RDU, solo genera reporte de prueba)"
+        description: "Modo simulación (true = NO escribe en RDU ni altera el resumen; registra [SIMULACIÓN] en la columna C de la Cola)"
         type: boolean
         required: true
         default: true
       limite:
-        description: "Límite de ítems (para link específico no aplica, para lote puedes poner ej. 1 o 5)"
+        description: "Límite de ítems a procesar (ej. 5 o 10; 0 = sin límite, procesa todos los pendientes)"
         required: false
-        default: "1"
+        default: "5"
+      reprocesar_todo:
+        description: "Reprocesar todo en la Cola (true = reevalúa filas aunque ya tengan resultado en columna C)"
+        type: boolean
+        required: false
+        default: false
       deepseek_model:
         description: "Modelo de DeepSeek a utilizar"
         required: false
@@ -33,17 +46,21 @@ jobs:
           python-version: "3.12"
 
       - name: Instalar dependencias
-        run: pip install httpx pypdf openai
+        run: pip install -r requirements.txt
 
       - name: Ejecutar corrección de autores con DeepSeek
         env:
+          MODO_ORIGEN: ${{ github.event.inputs.origen }}
           RDU_UI_URL: ${{ github.event.inputs.ui_url }}
           DRY_RUN: ${{ github.event.inputs.dry_run }}
           LIMITE: ${{ github.event.inputs.limite }}
+          REPROCESAR_TODO: ${{ github.event.inputs.reprocesar_todo }}
           DEEPSEEK_MODEL: ${{ github.event.inputs.deepseek_model }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           RDU_EMAIL: ${{ secrets.RDU_USER }}
           RDU_PASSWORD: ${{ secrets.RDU_PASS }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: python scripts/corregir_autores_desde_pdf.py
 
       - name: Subir reporte CSV
