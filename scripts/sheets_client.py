@@ -294,6 +294,11 @@ def obtener_pendientes_revision_cola(
         estado = fila[col_estado].strip() if col_estado < len(fila) else ""
         modificaciones = fila[col_mod].strip() if col_mod < len(fila) else ""
 
+        # Tanto Columna B (Estado) como Columna C (Modificaciones) deben estar en blanco
+        # para no trabajar con artículos ya finalizados manualmente
+        if estado:
+            continue
+
         if not reprocesar_todo:
             if modificaciones and not modificaciones.upper().startswith("ERROR"):
                 continue

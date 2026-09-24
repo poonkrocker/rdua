@@ -329,7 +329,14 @@ def obtener_info_workflowitem(client: httpx.Client, wf_id: str) -> dict:
     """
     url = f"{API}/workflow/workflowitems/{wf_id}?embed=item"
     r = client.get(url)
-    r.raise_for_status()
+    if r.status_code != 200:
+        # Reintento sin embed por si DSpace falla internamente al resolver el embed
+        r_bare = client.get(f"{API}/workflow/workflowitems/{wf_id}")
+        if r_bare.status_code == 200:
+            r = r_bare
+        else:
+            r.raise_for_status()
+
     data = r.json()
 
     sections = data.get("sections", {}) or {}
@@ -402,7 +409,7 @@ def resolver_candidatos(client: httpx.Client, entrada_url: str) -> list[dict]:
         try:
             return [obtener_info_workflowitem(client, wf_id)]
         except Exception as e:
-            sys.exit(f"[ERROR] No se pudo obtener el workflowitem {wf_id} de RDU: {e}")
+            raise RuntimeError(f"No se pudo obtener el workflowitem {wf_id} de RDU: {e}")
 
     # 2. Caso: Link o UUID de item (/items/<uuid>)
     m_uuid = re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", entrada, re.IGNORECASE)
@@ -422,7 +429,7 @@ def resolver_candidatos(client: httpx.Client, entrada_url: str) -> list[dict]:
         if wf_id:
             return [obtener_info_workflowitem(client, str(wf_id))]
         else:
-            sys.exit(f"[ERROR] No se encontró workflowitem activo para el item {uuid_item}.")
+            raise RuntimeError(f"No se encontró workflowitem activo para el item {uuid_item}.")
 
     # 3. Caso: Búsqueda MyDSpace con filtros
     params, rango_fechas = params_desde_url(entrada)
