@@ -440,7 +440,8 @@ def _desarmar(nombre: str):
     if "," not in nombre:
         return None, []
     ap, resto = nombre.split(",", 1)
-    return clave_autor(ap), resto.strip().split()
+    ap_norm = clave_autor(ap).replace("-", " ")
+    return ap_norm, resto.strip().split()
 
 
 # --------------------------------------------- coincidencia con el diccionario
@@ -490,22 +491,25 @@ def nivel_coincidencia(nombre_a: str, nombre_b: str) -> str | None:
         return None  # apellido distinto: nunca se asume nada
 
     atomos_a, atomos_b = _atomos(tok_a), _atomos(tok_b)
-    if not atomos_a or not atomos_b:
+    clean_a = [quitar_acentos(x).lower().strip("-.") for x in atomos_a if x]
+    clean_b = [quitar_acentos(y).lower().strip("-.") for y in atomos_b if y]
+    comp_a = [x for x in clean_a if len(x) > 1]
+    comp_b = [x for x in clean_b if len(x) > 1]
+
+    # 1. Ambos tienen nombres de pila completos
+    if comp_a and comp_b:
+        inter = set(comp_a) & set(comp_b)
+        if inter:
+            return "alta"
         return None
 
-    # Todos los nombres de pila que EXISTEN en ambos lados tienen que ser
-    # compatibles. Que a uno le sobre un segundo nombre esta bien; que se
-    # contradigan ('Leonardo' vs 'Luis') descarta la coincidencia.
-    tipos = []
-    for x, y in zip(atomos_a, atomos_b):
-        tipo = _atomos_compatibles(x, y)
-        if tipo is None:
-            return None
-        tipos.append(tipo)
+    # 2. Uno de los dos tiene solo iniciales
+    inits_a = [x[0] for x in clean_a if x]
+    inits_b = [x[0] for x in clean_b if x]
+    if inits_a and inits_b and (inits_a[0] == inits_b[0] or any(ia in inits_b for ia in inits_a)):
+        return "media"
 
-    # Si el PRIMER nombre de pila solo coincide por la inicial, la certeza baja:
-    # es el caso 'Abate, P.' contra 'Abate, Paula'.
-    return "media" if tipos[0] == "inicial" else "alta"
+    return None
 
 
 def indice_nombres_diccionario(nombres_originales) -> dict:

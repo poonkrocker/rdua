@@ -56,6 +56,11 @@ try:
         estandarizar_titulo,
         son_titulos_equivalentes,
         limpiar_descripcion,
+        buscar_en_diccionario,
+        nivel_coincidencia,
+        _desarmar,
+        es_run_de_iniciales,
+        clave_autor,
     )
 except ImportError:
     sys.path.append(os.path.dirname(__file__))
@@ -64,6 +69,11 @@ except ImportError:
         estandarizar_titulo,
         son_titulos_equivalentes,
         limpiar_descripcion,
+        buscar_en_diccionario,
+        nivel_coincidencia,
+        _desarmar,
+        es_run_de_iniciales,
+        clave_autor,
     )
 
 # Importar cliente de Google Sheets
@@ -682,17 +692,94 @@ def depurar_autor_sin_iniciales(autor: str) -> str:
 
 def son_autores_equivalentes(autores_a: list[str], autores_b: list[str]) -> bool:
     """Verifica si dos listas de autores representan exactamente a las mismas personas
-    ignorando iniciales secundarias (ej: 'Suárez, Andrea' y 'Suárez, Andrea B.').
-    """
+    ignorando iniciales secundarias, guiones o diferencias menores."""
     if len(autores_a) != len(autores_b):
         return False
 
     for a, b in zip(autores_a, autores_b):
-        limpio_a = depurar_autor_sin_iniciales(a).strip().lower()
-        limpio_b = depurar_autor_sin_iniciales(b).strip().lower()
-        if limpio_a != limpio_b:
+        limpio_a = depurar_autor_sin_iniciales(a).strip()
+        limpio_b = depurar_autor_sin_iniciales(b).strip()
+        if limpio_a.lower() == limpio_b.lower():
+            continue
+        # Tolerar diferencias de guión en apellido (ej: Flores-Kanter vs Flores Kanter)
+        if limpio_a.replace("-", " ").lower() == limpio_b.replace("-", " ").lower():
+            continue
+        # Verificar coincidencia exacta o alta
+        nivel = nivel_coincidencia(limpio_a, limpio_b)
+        if nivel not in ("exacta", "alta"):
             return False
     return True
+
+
+def canonicalizar_autor(autor: str, autores_rdu: list[str] | None = None, dicc_filiaciones: dict | None = None) -> str:
+    """Estandariza un autor propuesto priorizando:
+    1. El nombre canónico en el diccionario de Filiaciones de Google Sheets (fuente de verdad institucional).
+    2. El nombre que ya existía en RDU si coincide (evita agregar guiones o segundos nombres innecesarios).
+    3. Formato 'Apellido, Nombre' limpio sin iniciales intermedias.
+    """
+    limpio = depurar_autor_sin_iniciales(autor)
+    if not limpio:
+        return ""
+
+    # 1. Prioridad máxima: Diccionario institucional de filiaciones
+    if dicc_filiaciones:
+        m = buscar_en_diccionario(limpio, dicc_filiaciones)
+        if m.get("encontrado") and m.get("nivel") in ("exacta", "alta"):
+            return m["nombre"]
+
+    # 2. Prioridad secundaria: autores que ya estaban en RDU
+    # Si en RDU ya existía una versión equivalente de este autor, mantener la de RDU
+    # salvo que en RDU haya tenido solo una inicial y ahora tengamos el nombre completo.
+    for rdu_a in (autores_rdu or []):
+        rdu_clean = depurar_autor_sin_iniciales(rdu_a)
+        if not rdu_clean:
+            continue
+        nivel = nivel_coincidencia(limpio, rdu_clean)
+        if nivel in ("exacta", "alta"):
+            # Verificar si rdu_clean tenía solo inicial en el nombre de pila
+            ap_r, tokens_r = _desarmar(rdu_clean)
+            if tokens_r and len(tokens_r[0].strip(".")) > 1 and not es_run_de_iniciales(tokens_r[0]):
+                return rdu_clean
+
+    return limpio
+
+
+def autor_tiene_filiacion(autor: str, dicc_filiaciones: dict | None) -> bool:
+    """Verifica si un autor está presente en el diccionario de Filiaciones."""
+    if not dicc_filiaciones or not autor:
+        return False
+    m = buscar_en_diccionario(autor, dicc_filiaciones, minimo="alta")
+    if m.get("encontrado") and not m.get("ambiguo"):
+        return True
+    c = clave_autor(autor)
+    if c in dicc_filiaciones:
+        return True
+    return False
+
+
+def describir_cambios_autores(autores_anteriores: list[str], autores_nuevos: list[str]) -> str:
+    """Genera una descripción precisa de las diferencias reales entre autores."""
+    cambios = []
+    eliminados = [a for a in autores_anteriores if not any(son_autores_equivalentes([a], [n]) for n in autores_nuevos)]
+    agregados = [a for a in autores_nuevos if not any(son_autores_equivalentes([a], [ant]) for ant in autores_anteriores)]
+    modificados = []
+    if len(autores_anteriores) == len(autores_nuevos):
+        for ant, n in zip(autores_anteriores, autores_nuevos):
+            if ant != n and not son_autores_equivalentes([ant], [n]):
+                modificados.append(f"de '{ant}' a '{n}'")
+            elif ant != n and ("." in ant and "." not in n):
+                modificados.append(f"se completó el nombre de '{ant}' a '{n}'")
+
+    if eliminados:
+        cambios.append(f"se eliminó autor {', '.join(eliminados)}")
+    if agregados:
+        cambios.append(f"se agregó autor {', '.join(agregados)}")
+    if modificados:
+        cambios.extend(modificados)
+
+    if not cambios:
+        return "autores actualizados según PDF"
+    return "; ".join(cambios)
 
 
 def consultar_deepseek(client_ai: OpenAI, model: str, titulo_rdu: str, autores_rdu: list[str], texto_pdf: str) -> dict:
@@ -717,11 +804,15 @@ def consultar_deepseek(client_ai: OpenAI, model: str, titulo_rdu: str, autores_r
         "   - Si el título en RDU ya cumple esto o es equivalente, consérvalo tal cual.\n\n"
         "2. REGLA ESTRICTA PARA AUTORES:\n"
         "   - Formato OBLIGATORIO: SOLO 'Apellido, Nombre' (para que coincida con el registro institucional de filiaciones en Sheets).\n"
+        "   - NUNCA agregues guiones a apellidos compuestos ni iniciales o segundos nombres adicionales si el autor ya figura en RDU o coincide con él.\n"
+        "     * Ejemplo: Si en RDU figura 'Flores Kanter, Ezequiel' y en el PDF dice 'Flores-Kanter, Pablo Ezequiel', NO agregues guion ni segundo nombre. Conserva exactamente 'Flores Kanter, Ezequiel'.\n"
+        "     * Ejemplo: Si en RDU figura 'Medrano, Leonardo' y en el PDF dice 'Medrano, Leonardo Adrián', NO agregues 'Adrián'. Conserva exactamente 'Medrano, Leonardo'.\n"
         "   - NUNCA agregues iniciales intermedias o secundarias (ej: si en el PDF dice 'Suárez, Andrea B.', debe quedar 'Suárez, Andrea'; si dice 'Mustaca, Alba E.', debe quedar 'Mustaca, Alba'). No incluyas iniciales sueltas como 'B.', 'E.', 'M.', etc.\n"
-        "   - NO MODIFICAR AUTORES QUE YA COINCIDEN: Si los autores registrados en RDU ya corresponden a los del PDF y la única diferencia es que el PDF trae iniciales intermedias (ej: RDU tiene 'Suárez, Andrea' y el PDF tiene 'Suárez, Andrea B.'), NO DEBES MODIFICARLOS. Mantén exactamente los autores de RDU y reporta que NO hubo cambios de autores.\n"
+        "   - NO MODIFICAR AUTORES QUE YA COINCIDEN: Si los autores registrados en RDU ya corresponden a los del PDF y la única diferencia es que el PDF trae iniciales intermedias, un segundo nombre, o guiones en el apellido, NO DEBES MODIFICARLOS. Mantén exactamente los autores de RDU y reporta que NO hubo cambios de autores.\n"
         "   - Solo modifica autores si:\n"
         "     * Falta un autor en RDU que sí está en el PDF (agrégalo respetando el orden, formato 'Apellido, Nombre' sin iniciales secundarias).\n"
-        "     * En RDU el nombre de pila está solo como inicial y en el PDF figura completo (ej: 'Abate, P.' en RDU -> 'Abate, Paula' según PDF).\n"
+        "     * En RDU el autor tiene solo una inicial como primer nombre y en el PDF figura completo (ej: 'Abate, P.' en RDU -> 'Abate, Paula' según PDF).\n"
+        "     * Hay un autor cargado en RDU que no corresponde al PDF y debe eliminarse.\n"
         "     * El orden de los autores en RDU está invertido respecto al PDF.\n"
         "     * Hay una errata ortográfica evidente en el apellido o nombre.\n\n"
         "3. RESUMEN DE MODIFICACIONES:\n"
@@ -1051,6 +1142,7 @@ def procesar_flujo(
         "Titulo_Nuevo",
         "Autores_Anteriores",
         "Autores_Nuevos",
+        "Autores_Sin_Filiacion",
         "Modificaciones",
         "Accion",
         "Link_Workflow",
@@ -1064,6 +1156,7 @@ def procesar_flujo(
 
     ws_cola = None
     sc_mod = None
+    dicc_filiaciones = {}
     if origen == "cola":
         if not os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
             sys.exit("[ERROR] Falta GOOGLE_SERVICE_ACCOUNT_JSON en el entorno o en los secrets de GitHub para acceder a Google Sheets.")
@@ -1088,6 +1181,26 @@ def procesar_flujo(
             print("[INFO] No hay ítems pendientes de revisión en la hoja 'Cola' (las filas ya tienen resultado en Columna C).")
             return
 
+        try:
+            print("[FILIACIONES] Cargando diccionario de la pestaña 'Filiaciones'...", file=sys.stderr)
+            dicc_filiaciones = sc_mod.leer_diccionario_filiaciones(sheet_id=sid)
+        except Exception as e_fil:
+            print(f"  [WARN] No se pudo cargar el diccionario de filiaciones: {e_fil}", file=sys.stderr)
+            dicc_filiaciones = {}
+    else:
+        # Si hay credenciales de Sheets disponibles en modo URL/individual, cargar diccionario de filiaciones
+        if os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
+            try:
+                if sc is None:
+                    sys.path.append(os.path.dirname(__file__))
+                    import sheets_client as sc_mod
+                else:
+                    sc_mod = sc
+                sid = google_sheet_id or os.environ.get("GOOGLE_SHEET_ID") or "1gh2n-gbxiSzrCQZG4-Pkq52eMmbLzJiGnb_6vP4zEQU"
+                dicc_filiaciones = sc_mod.leer_diccionario_filiaciones(sheet_id=sid)
+            except Exception:
+                dicc_filiaciones = {}
+
     with httpx.Client(timeout=60, headers=HEADERS_BASE, follow_redirects=True) as client:
         login(client, email, password)
 
@@ -1106,9 +1219,20 @@ def procesar_flujo(
                 if ws_cola and row_idx and sc_mod:
                     try:
                         sc_mod.marcar_modificaciones_cola(ws_cola, row_idx, texto)
-                        print(f"  [COLA] Fila {row_idx} -> Col C: {texto}")
+                        print(f"  [COLA] Fila {row_idx} -> Col C (Modificaciones): {texto}")
                     except Exception as ex_c:
                         print(f"  [WARN] No se pudo escribir en Col C de Google Sheets (fila {row_idx}): {ex_c}", file=sys.stderr)
+
+            def reportar_col_d(texto: str):
+                if ws_cola and row_idx and sc_mod:
+                    try:
+                        sc_mod.marcar_filiaciones_faltantes_cola(ws_cola, row_idx, texto)
+                        if texto:
+                            print(f"  [COLA] Fila {row_idx} -> Col D (Falta filiación): {texto}")
+                        else:
+                            print(f"  [COLA] Fila {row_idx} -> Col D: (todos los autores tienen filiación)")
+                    except Exception as ex_d:
+                        print(f"  [WARN] No se pudo escribir en Col D de Google Sheets (fila {row_idx}): {ex_d}", file=sys.stderr)
 
             if origen == "cola":
                 print(f"\n[PROCESANDO COLA #{idx}/{len(trabajos)} (Fila {row_idx})] Link: {link_origen}")
@@ -1118,6 +1242,7 @@ def procesar_flujo(
                     err_msg = f"ERROR: No se pudo resolver link {link_origen}: {e}"
                     print(f"  [ERROR] {err_msg}", file=sys.stderr)
                     reportar_col_c(err_msg)
+                    reportar_col_d("")
                     filas_reporte.append({
                         "Fecha": datetime.now().isoformat(),
                         "Workflowitem_ID": "",
@@ -1126,6 +1251,7 @@ def procesar_flujo(
                         "Titulo_Nuevo": "",
                         "Autores_Anteriores": "",
                         "Autores_Nuevos": "",
+                        "Autores_Sin_Filiacion": "",
                         "Modificaciones": err_msg,
                         "Accion": "ERROR",
                         "Link_Workflow": link_origen,
@@ -1138,6 +1264,7 @@ def procesar_flujo(
                     err_msg = f"ERROR: No se encontró workflowitem activo para {link_origen}"
                     print(f"  [ERROR] {err_msg}", file=sys.stderr)
                     reportar_col_c(err_msg)
+                    reportar_col_d("")
                     filas_reporte.append({
                         "Fecha": datetime.now().isoformat(),
                         "Workflowitem_ID": "",
@@ -1146,6 +1273,7 @@ def procesar_flujo(
                         "Titulo_Nuevo": "",
                         "Autores_Anteriores": "",
                         "Autores_Nuevos": "",
+                        "Autores_Sin_Filiacion": "",
                         "Modificaciones": err_msg,
                         "Accion": "ERROR",
                         "Link_Workflow": link_origen,
@@ -1163,6 +1291,7 @@ def procesar_flujo(
                 print(f"[SKIP] Objeto #{idx} sin workflowitem_id.", file=sys.stderr)
                 if row_idx:
                     reportar_col_c("ERROR: Sin workflowitem_id")
+                    reportar_col_d("")
                 continue
 
             # Traer SIEMPRE o enriquecer con los metadatos vivos y completos de RDU (sections, uuid, etc.)
@@ -1187,6 +1316,7 @@ def procesar_flujo(
             if not texto_pdf:
                 print(f"  [OMITIDO] No se pudo extraer texto del PDF: {det_pdf}")
                 reportar_col_c(f"OMITIDO: {det_pdf}")
+                reportar_col_d("")
                 filas_reporte.append({
                     "Fecha": datetime.now().isoformat(),
                     "Workflowitem_ID": wf_id,
@@ -1195,6 +1325,7 @@ def procesar_flujo(
                     "Titulo_Nuevo": titulo_rdu,
                     "Autores_Anteriores": "; ".join(autores_rdu),
                     "Autores_Nuevos": "; ".join(autores_rdu),
+                    "Autores_Sin_Filiacion": "",
                     "Modificaciones": det_pdf,
                     "Accion": f"OMITIDO: {det_pdf}",
                     "Link_Workflow": item.get("link_workflow") or link_origen,
@@ -1213,6 +1344,11 @@ def procesar_flujo(
                 print(f"  [ALERTA] ADJUNTO NO CORRESPONDE: {motivo}")
                 print(f"  -> NO se modifican autores ni título. Se marcará [ADJUNTO NO CORRESPONDE] en el resumen.")
 
+                # Verificar autores actuales de RDU contra Filiaciones para Columna D
+                autores_sin_fil = [a for a in autores_rdu if not autor_tiene_filiacion(a, dicc_filiaciones)]
+                texto_col_d = f"Falta filiación: {'; '.join(autores_sin_fil)}" if autores_sin_fil else ""
+                reportar_col_d(texto_col_d)
+
                 if dry_run:
                     print("  [SIMULACIÓN] Se agregaría '[ADJUNTO NO CORRESPONDE]' al inicio del Resumen sin modificar autores/título.")
                     reportar_col_c(f"[SIMULACIÓN] [ADJUNTO NO CORRESPONDE] {motivo}")
@@ -1224,6 +1360,7 @@ def procesar_flujo(
                         "Titulo_Nuevo": titulo_rdu,
                         "Autores_Anteriores": "; ".join(autores_rdu),
                         "Autores_Nuevos": "; ".join(autores_rdu),
+                        "Autores_Sin_Filiacion": texto_col_d,
                         "Modificaciones": motivo,
                         "Accion": "SIMULADO_ADJUNTO_NO_CORRESPONDE",
                         "Link_Workflow": item.get("link_workflow") or link_origen,
@@ -1260,6 +1397,7 @@ def procesar_flujo(
                             "Titulo_Nuevo": titulo_rdu,
                             "Autores_Anteriores": "; ".join(autores_rdu),
                             "Autores_Nuevos": "; ".join(autores_rdu),
+                            "Autores_Sin_Filiacion": texto_col_d,
                             "Modificaciones": motivo,
                             "Accion": "MARCADO_ADJUNTO_NO_CORRESPONDE",
                             "Link_Workflow": item.get("link_workflow") or link_origen,
@@ -1278,6 +1416,7 @@ def procesar_flujo(
                             "Titulo_Nuevo": titulo_rdu,
                             "Autores_Anteriores": "; ".join(autores_rdu),
                             "Autores_Nuevos": "; ".join(autores_rdu),
+                            "Autores_Sin_Filiacion": texto_col_d,
                             "Modificaciones": f"ERROR: {e}",
                             "Accion": "ERROR",
                             "Link_Workflow": item.get("link_workflow") or link_origen,
@@ -1291,17 +1430,19 @@ def procesar_flujo(
                 continue
 
             # CASO B: EL ADJUNTO SÍ CORRESPONDE AL ARTÍCULO
-            # 1. Depurar autores propuestos: estrictamente SOLO 'Apellido, Nombre' sin iniciales secundarias
+            # 1. Canonicalizar autores propuestos contra Filiaciones y RDU
             autores_propuestos_crudos = analisis.get("autores_corregidos") or autores_rdu
-            autores_propuestos = [depurar_autor_sin_iniciales(a) for a in autores_propuestos_crudos]
+            autores_canonicos = [
+                canonicalizar_autor(a, autores_rdu, dicc_filiaciones)
+                for a in autores_propuestos_crudos if a
+            ]
 
-            # 2. Si los autores propuestos coinciden con los de RDU (la única diferencia eran iniciales intermedias),
-            # NO modificarlos: conservar exactamente los de RDU.
-            if son_autores_equivalentes(autores_rdu, autores_propuestos):
+            # 2. Evaluar cambios de autores
+            if son_autores_equivalentes(autores_rdu, autores_canonicos):
                 autores_nuevos = list(autores_rdu)
                 cambio_autores = False
             else:
-                autores_nuevos = autores_propuestos
+                autores_nuevos = autores_canonicos
                 cambio_autores = (autores_nuevos != autores_rdu)
 
             # 3. Título corregido y estandarizado según normas institucionales RDU
@@ -1326,10 +1467,15 @@ def procesar_flujo(
                 titulo_nuevo = titulo_propuesto_std
                 cambio_titulo = True
 
-            # 4. Determinar si realmente existen cambios efectivos
+            # 4. Verificar autores sin filiación en la pestaña Filiaciones para Columna D
+            autores_sin_fil = [a for a in autores_nuevos if not autor_tiene_filiacion(a, dicc_filiaciones)]
+            texto_col_d = f"Falta filiación: {'; '.join(autores_sin_fil)}" if autores_sin_fil else ""
+            reportar_col_d(texto_col_d)
+
+            # 5. Determinar si realmente existen cambios efectivos
             hay_cambios = cambio_titulo or cambio_autores
             if not hay_cambios:
-                print("  [OK] DeepSeek y validación determinaron que los metadatos coinciden (sin iniciales extra, formato RDU ' : ') y NO se requieren modificaciones.")
+                print("  [OK] Metadatos coincidentes (formato institucional RDU y filiaciones validadas), NO se requieren modificaciones.")
                 reportar_col_c("Sin cambios requeridos (metadatos coincidentes)")
                 filas_reporte.append({
                     "Fecha": datetime.now().isoformat(),
@@ -1339,6 +1485,7 @@ def procesar_flujo(
                     "Titulo_Nuevo": titulo_rdu,
                     "Autores_Anteriores": "; ".join(autores_rdu),
                     "Autores_Nuevos": "; ".join(autores_rdu),
+                    "Autores_Sin_Filiacion": texto_col_d,
                     "Modificaciones": "Sin cambios requeridos (metadatos coincidentes)",
                     "Accion": "SIN_CAMBIOS",
                     "Link_Workflow": item.get("link_workflow") or link_origen,
@@ -1354,15 +1501,14 @@ def procesar_flujo(
                 else:
                     modificaciones = "Modificaciones: se corrigió el título según PDF"
             elif cambio_autores and not cambio_titulo:
-                modificaciones = analisis.get("resumen_modificaciones") or "Modificaciones en autores según PDF"
-                if "inicial" in modificaciones.lower() and not any(es_token_inicial_secundaria(tok) for a in autores_nuevos for tok in a.split()[1:]):
-                    modificaciones = "Modificaciones: autores actualizados según PDF"
+                desc_autores = describir_cambios_autores(autores_rdu, autores_nuevos)
+                modificaciones = f"Modificaciones: {desc_autores}"
             else:
+                desc_autores = describir_cambios_autores(autores_rdu, autores_nuevos)
                 if son_titulos_equivalentes(titulo_rdu, titulo_nuevo):
-                    mod_autores = analisis.get("resumen_modificaciones") or "Modificaciones en autores según PDF"
-                    modificaciones = f"{mod_autores}; se estandarizó el formato del título (minúsculas y ' : ')"
+                    modificaciones = f"Modificaciones: {desc_autores}; se estandarizó el formato del título (minúsculas y ' : ')"
                 else:
-                    modificaciones = analisis.get("resumen_modificaciones") or "Modificaciones en título y autores según PDF"
+                    modificaciones = f"Modificaciones: se corrigió el título según PDF; {desc_autores}"
 
             print(f"  [CAMBIOS DETECTADOS]: {modificaciones}")
             if cambio_titulo:
@@ -1381,6 +1527,7 @@ def procesar_flujo(
                     "Titulo_Nuevo": titulo_nuevo,
                     "Autores_Anteriores": "; ".join(autores_rdu),
                     "Autores_Nuevos": "; ".join(autores_nuevos),
+                    "Autores_Sin_Filiacion": texto_col_d,
                     "Modificaciones": modificaciones,
                     "Accion": "SIMULADO_CORREGIDO",
                     "Link_Workflow": item.get("link_workflow") or link_origen,
@@ -1426,6 +1573,7 @@ def procesar_flujo(
                         "Titulo_Nuevo": t_fin,
                         "Autores_Anteriores": "; ".join(autores_rdu),
                         "Autores_Nuevos": a_fin,
+                        "Autores_Sin_Filiacion": texto_col_d,
                         "Modificaciones": modificaciones,
                         "Accion": "MODIFICADO_Y_DEVUELTO_AL_POOL",
                         "Link_Workflow": item.get("link_workflow") or link_origen,
@@ -1445,6 +1593,7 @@ def procesar_flujo(
                         "Titulo_Nuevo": titulo_nuevo,
                         "Autores_Anteriores": "; ".join(autores_rdu),
                         "Autores_Nuevos": "; ".join(autores_nuevos),
+                        "Autores_Sin_Filiacion": texto_col_d,
                         "Modificaciones": f"ERROR: {e}",
                         "Accion": "ERROR",
                         "Link_Workflow": item.get("link_workflow") or link_origen,

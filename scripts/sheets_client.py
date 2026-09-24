@@ -137,7 +137,7 @@ def _clave_encabezado(nombre: str) -> str:
     """Normaliza un nombre de encabezado para comparar: sin acentos, en
     minusculas y sin espacios extra. Asi 'Filiación', 'Filiacion' y
     'FILIACION ' apuntan todos a lo mismo."""
-    return " ".join(_sin_acentos(nombre or "").strip().lower().split())
+    return " ".join(_sin_acentos((nombre or "").replace("_", " ")).strip().lower().split())
 
 
 def _col(fila: dict, nombre: str):
@@ -338,6 +338,29 @@ def marcar_modificaciones_cola(ws, row_index: int, modificaciones: str, col_c: i
     )
 
 
+def marcar_filiaciones_faltantes_cola(ws, row_index: int, texto_faltantes: str, col_d: int = 4):
+    """Actualiza la columna D (Autores sin filiación) de la hoja Cola para una fila puntual.
+    Si la fila 1 en esa columna no tiene encabezado, le coloca 'Autores_Sin_Filiacion'.
+    """
+    col = _indice_columna(ws, "Autores_Sin_Filiacion", col_d)
+    try:
+        val_h = ws.cell(1, col).value
+        if not val_h:
+            ws.update_cell(1, col, "Autores_Sin_Filiacion")
+            cache_key = (ws.title, _clave_encabezado("Autores_Sin_Filiacion"))
+            _cache["col_estado"][cache_key] = col
+    except Exception:
+        pass
+
+    _con_reintentos(
+        f"marcar filiaciones faltantes fila {row_index}",
+        ws.update_cell,
+        row_index,
+        col,
+        texto_faltantes,
+    )
+
+
 def obtener_pendientes_filiaciones(max_items: int | None = None):
     """Igual que obtener_pendientes() pero para la cola ColaFiliaciones."""
     ws = _hoja(HOJA_COLA_FILIACIONES, crear_con=["Link", "Estado"])
@@ -366,12 +389,12 @@ def _normalizar_autor(autor: str) -> str:
     return " ".join(_sin_acentos((autor or "").strip().lower()).split())
 
 
-def leer_diccionario_filiaciones() -> dict:
+def leer_diccionario_filiaciones(sheet_id: str | None = None) -> dict:
     """Devuelve {clave_autor_normalizada: [filiacion1, filiacion2, ...]} desde la
     hoja Filiaciones. Un autor puede tener MÁS DE UNA filiación. Si la hoja no
     existe, devuelve diccionario vacío (no es un error)."""
     try:
-        ws = _hoja(HOJA_FILIACIONES)
+        ws = _hoja(HOJA_FILIACIONES, sheet_id=sheet_id)
     except Exception:
         print("  [INFO] No existe la hoja 'Filiaciones' todavía; se usará vacía.")
         return {}
@@ -384,10 +407,9 @@ def leer_diccionario_filiaciones() -> dict:
         fil = str(_col(fila, "Filiacion") or "").strip()
         if autor:
             nombres_originales.add(autor)
-        if autor and fil:
             clave = _normalizar_autor(autor)
             dicc.setdefault(clave, [])
-            if fil not in dicc[clave]:  # evitar duplicado EXACTO de texto
+            if fil and fil not in dicc[clave]:  # evitar duplicado EXACTO de texto
                 dicc[clave].append(fil)
 
     # indice para completar nombres abreviados usando la forma canonica exacta.
