@@ -799,12 +799,13 @@ def marcar_adjunto_no_corresponde(
         resumen_actual = val_resumen[0].get("value", "")
         lang_resumen = val_resumen[0].get("language") or "es"
 
+    resumen_limpio = limpiar_descripcion(resumen_actual)
     marca = "[ADJUNTO NO CORRESPONDE]"
     # Agregar marca al inicio si no la tiene
-    if not re.search(r"ADJUNTO\s+NO\s+CORRESPONDE", resumen_actual, re.IGNORECASE):
-        nuevo_cuerpo = f"{marca} {resumen_actual}".strip()
+    if not re.search(r"ADJUNTO\s+NO\s+CORRESPONDE", resumen_limpio, re.IGNORECASE):
+        nuevo_cuerpo = f"{marca} {resumen_limpio}".strip()
     else:
-        nuevo_cuerpo = resumen_actual
+        nuevo_cuerpo = resumen_limpio
 
     # Agregar nota explicativa si se proporcionó motivo
     if motivo and f"[{motivo}]" not in nuevo_cuerpo:
@@ -936,19 +937,20 @@ def aplicar_cambios_workflowitem(
                         "path": f"/sections/{sid_autores}/dc.contributor.author/{i}",
                     })
 
-    # 3. Resumen: concatenar nota al final entre corchetes
+    # 3. Resumen: limpiar según reglas institucionales de Descripciones y concatenar nota al final entre corchetes
     resumen_actual = ""
     lang_resumen = "es"
     if val_resumen and len(val_resumen) > 0:
         resumen_actual = val_resumen[0].get("value", "")
         lang_resumen = val_resumen[0].get("language") or "es"
 
+    resumen_limpio = limpiar_descripcion(resumen_actual)
     nota_final = f"[{resumen_modificaciones.strip('[]')}]"
-    if resumen_actual.strip():
-        if nota_final not in resumen_actual:
-            resumen_nuevo = f"{resumen_actual.strip()}\n\n{nota_final}"
+    if resumen_limpio:
+        if nota_final not in resumen_limpio:
+            resumen_nuevo = f"{resumen_limpio}\n\n{nota_final}"
         else:
-            resumen_nuevo = resumen_actual
+            resumen_nuevo = resumen_limpio
     else:
         resumen_nuevo = nota_final
 
