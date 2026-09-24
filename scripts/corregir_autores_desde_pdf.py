@@ -49,6 +49,23 @@ import httpx
 from openai import OpenAI
 from pypdf import PdfReader
 
+# Importar reglas de formato institucional de RDU
+try:
+    from formato import (
+        dividir_titulo_subtitulo,
+        estandarizar_titulo,
+        son_titulos_equivalentes,
+        limpiar_descripcion,
+    )
+except ImportError:
+    sys.path.append(os.path.dirname(__file__))
+    from formato import (
+        dividir_titulo_subtitulo,
+        estandarizar_titulo,
+        son_titulos_equivalentes,
+        limpiar_descripcion,
+    )
+
 BASE_URL = os.environ.get("RDU_BASE_URL", "https://rdu.unc.edu.ar").rstrip("/")
 API = f"{BASE_URL}/server/api"
 
@@ -674,9 +691,13 @@ def consultar_deepseek(client_ai: OpenAI, model: str, titulo_rdu: str, autores_r
         "   - Si el documento sí es el mismo artículo (aunque tenga autores que no habían sido cargados, nombres con iniciales a completar,\n"
         "     o pequeñas erratas en el título), indica: 'adjunto_corresponde': true.\n\n"
         "Instrucciones si 'adjunto_corresponde' es true:\n"
-        "1. TÍTULO:\n"
-        "   - Corrige erratas evidentes o mayúsculas sostenidas a sentence case.\n"
-        "   - Si ya es correcto, consérvalo tal cual.\n\n"
+        "1. TÍTULO (REGLAS INSTITUCIONALES RDU):\n"
+        "   - Formato obligatorio: 'formato oración' (mayúscula solo al inicio del título, resto en minúsculas salvo nombres propios y siglas como UNC, CONICET, etc.).\n"
+        "   - SEPARADOR OBLIGATORIO DE SUBTÍTULO: ' : ' (espacio, dos puntos, espacio). Ejemplo: 'Título principal : subtítulo'.\n"
+        "   - El subtítulo DEBE empezar en MINÚSCULA (salvo que la primera palabra sea un nombre propio o sigla).\n"
+        "   - SIN PUNTO FINAL.\n"
+        "   - NUNCA cambies ' : ' por ': ' (en RDU el espacio antes de los dos puntos es la norma institucional oficial).\n"
+        "   - Si el título en RDU ya cumple esto o es equivalente, consérvalo tal cual.\n\n"
         "2. REGLA ESTRICTA PARA AUTORES:\n"
         "   - Formato OBLIGATORIO: SOLO 'Apellido, Nombre' (para que coincida con el registro institucional de filiaciones en Sheets).\n"
         "   - NUNCA agregues iniciales intermedias o secundarias (ej: si en el PDF dice 'Suárez, Andrea B.', debe quedar 'Suárez, Andrea'; si dice 'Mustaca, Alba E.', debe quedar 'Mustaca, Alba'). No incluyas iniciales sueltas como 'B.', 'E.', 'M.', etc.\n"
@@ -1168,14 +1189,32 @@ def procesar_flujo(
                 autores_nuevos = autores_propuestos
                 cambio_autores = (autores_nuevos != autores_rdu)
 
-            # 3. Título corregido
-            titulo_nuevo = (analisis.get("titulo_corregido") or titulo_rdu).strip()
-            cambio_titulo = (titulo_nuevo != titulo_rdu.strip())
+            # 3. Título corregido y estandarizado según normas institucionales RDU
+            # Formato RDU: minúsculas (formato oración), ' : ' entre título y subtítulo,
+            # subtítulo en minúscula, sin punto final.
+            titulo_propuesto_raw = (analisis.get("titulo_corregido") or titulo_rdu).strip()
+            titulo_rdu_std = estandarizar_titulo(titulo_rdu)
+            titulo_propuesto_std = estandarizar_titulo(titulo_propuesto_raw)
+
+            # Si el título propuesto es semánticamente equivalente al de RDU (mismas palabras, solo puntuación/mayúsculas)
+            if son_titulos_equivalentes(titulo_rdu, titulo_propuesto_std):
+                # Si el título en RDU ya cumplía la estandarización exacta (ej: ya tenía ' : ' y minúsculas)
+                if titulo_rdu.strip() == titulo_rdu_std:
+                    titulo_nuevo = titulo_rdu.strip()
+                    cambio_titulo = False
+                else:
+                    # El título en RDU tenía mayúsculas sostenidas, faltaba espacio en dos puntos, etc.
+                    titulo_nuevo = titulo_rdu_std
+                    cambio_titulo = True
+            else:
+                # El título del PDF es diferente (corrección de palabras o erratas)
+                titulo_nuevo = titulo_propuesto_std
+                cambio_titulo = True
 
             # 4. Determinar si realmente existen cambios efectivos
             hay_cambios = cambio_titulo or cambio_autores
             if not hay_cambios:
-                print("  [OK] DeepSeek y validación determinaron que los metadatos coinciden (sin iniciales extra) y NO se requieren modificaciones.")
+                print("  [OK] DeepSeek y validación determinaron que los metadatos coinciden (sin iniciales extra, formato RDU ' : ') y NO se requieren modificaciones.")
                 filas_reporte.append({
                     "Fecha": datetime.now().isoformat(),
                     "Workflowitem_ID": wf_id,
@@ -1194,13 +1233,20 @@ def procesar_flujo(
 
             # Construir resumen de modificaciones conciso y preciso
             if cambio_titulo and not cambio_autores:
-                modificaciones = "Modificaciones: se corrigió el título según PDF"
+                if son_titulos_equivalentes(titulo_rdu, titulo_nuevo):
+                    modificaciones = "Modificaciones: se estandarizó el formato del título (minúsculas y ' : ')"
+                else:
+                    modificaciones = "Modificaciones: se corrigió el título según PDF"
             elif cambio_autores and not cambio_titulo:
                 modificaciones = analisis.get("resumen_modificaciones") or "Modificaciones en autores según PDF"
                 if "inicial" in modificaciones.lower() and not any(es_token_inicial_secundaria(tok) for a in autores_nuevos for tok in a.split()[1:]):
                     modificaciones = "Modificaciones: autores actualizados según PDF"
             else:
-                modificaciones = analisis.get("resumen_modificaciones") or "Modificaciones en título y autores según PDF"
+                if son_titulos_equivalentes(titulo_rdu, titulo_nuevo):
+                    mod_autores = analisis.get("resumen_modificaciones") or "Modificaciones en autores según PDF"
+                    modificaciones = f"{mod_autores}; se estandarizó el formato del título (minúsculas y ' : ')"
+                else:
+                    modificaciones = analisis.get("resumen_modificaciones") or "Modificaciones en título y autores según PDF"
 
             print(f"  [CAMBIOS DETECTADOS]: {modificaciones}")
             if cambio_titulo:
