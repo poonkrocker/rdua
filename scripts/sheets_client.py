@@ -18,12 +18,19 @@ CAMBIOS IMPORTANTES DE ESTA VERSIÓN
 4. Índice de la columna Estado cacheado (antes se leía la fila 1 en cada
    marcado, sumando llamadas de API al pedo).
 """
+from __future__ import annotations
+
 import os
 import time
+import re
 from datetime import date
 
-import gspread
-from google.oauth2.service_account import Credentials
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+except ImportError:
+    gspread = None
+    Credentials = None
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -392,16 +399,24 @@ def _normalizar_autor(autor: str) -> str:
 def leer_diccionario_filiaciones(sheet_id: str | None = None) -> dict:
     """Devuelve {clave_autor_normalizada: [filiacion1, filiacion2, ...]} desde la
     hoja Filiaciones. Un autor puede tener MÁS DE UNA filiación. Si la hoja no
-    existe, devuelve diccionario vacío (no es un error)."""
+    existe, devuelve diccionario vacío (no es un error).
+
+    Además, almacena detalles temporales (Año_Inicio, Año_Fin) bajo:
+    dicc['__detalles__'][clave_autor] = [
+        {"filiacion": str, "inicio": int | None, "fin": int | None}
+    ]
+    """
     try:
         ws = _hoja(HOJA_FILIACIONES, sheet_id=sheet_id)
     except Exception:
         print("  [INFO] No existe la hoja 'Filiaciones' todavía; se usará vacía.")
         return {}
 
-    filas = _leer_tabla(ws)  # encabezados esperados: Autor, Filiacion
-    dicc = {}
+    filas = _leer_tabla(ws)  # encabezados esperados: Autor, Filiacion, Año_Inicio, Año_Fin
+    dicc = {"__detalles__": {}}
     nombres_originales = set()  # texto EXACTO de la columna Autor (fuente de verdad)
+    import re
+
     for fila in filas:
         autor = str(_col(fila, "Autor") or "").strip()
         fil = str(_col(fila, "Filiacion") or "").strip()
@@ -411,6 +426,21 @@ def leer_diccionario_filiaciones(sheet_id: str | None = None) -> dict:
             dicc.setdefault(clave, [])
             if fil and fil not in dicc[clave]:  # evitar duplicado EXACTO de texto
                 dicc[clave].append(fil)
+
+            # Extraer años de inicio y fin si están presentes
+            ini_raw = str(_col(fila, "Año_Inicio") or _col(fila, "Ano_Inicio") or _col(fila, "Inicio") or "").strip()
+            fin_raw = str(_col(fila, "Año_Fin") or _col(fila, "Ano_Fin") or _col(fila, "Fin") or "").strip()
+
+            m_ini = re.search(r"\b(19\d\d|20\d\d)\b", ini_raw)
+            m_fin = re.search(r"\b(19\d\d|20\d\d)\b", fin_raw)
+            anio_ini = int(m_ini.group(1)) if m_ini else None
+            anio_fin = int(m_fin.group(1)) if m_fin else None
+
+            dicc["__detalles__"].setdefault(clave, []).append({
+                "filiacion": fil,
+                "inicio": anio_ini,
+                "fin": anio_fin,
+            })
 
     # indice para completar nombres abreviados usando la forma canonica exacta.
     # Se guarda bajo '__nombres__' para que formato.buscar_en_diccionario lo use.
@@ -428,8 +458,10 @@ def leer_diccionario_filiaciones(sheet_id: str | None = None) -> dict:
     return dicc
 
 
-def agregar_filiacion(autor: str, filiacion: str, dicc_actual: dict | None = None):
-    """Agrega una filiación al diccionario. Un mismo autor puede tener varias
+def agregar_filiacion(autor: str, filiacion: str, dicc_actual: dict | None = None,
+                      anio_inicio: int | str | None = None, anio_fin: int | str | None = None):
+    """Agrega una filiación al diccionario con sus columnas correspondientes
+    (Autor, Filiacion, Año_Inicio, Año_Fin). Un mismo autor puede tener varias
     filiaciones distintas (todas se guardan); solo se evita el duplicado EXACTO
     (mismo autor + mismo texto de filiación ya cargado)."""
     clave = _normalizar_autor(autor)
@@ -437,13 +469,33 @@ def agregar_filiacion(autor: str, filiacion: str, dicc_actual: dict | None = Non
     if filiacion in existentes.get(clave, []):
         return False  # ya estaba cargada tal cual, no duplicar
 
-    ws = _hoja(HOJA_FILIACIONES, crear_con=["Autor", "Filiacion"])
+    ws = _hoja(HOJA_FILIACIONES, crear_con=["Autor", "Filiacion", "Año_Inicio", "Año_Fin"])
+    # Asegurar que la fila 1 tenga encabezados de 4 columnas si la hoja ya existía con 2
+    try:
+        col3_val = ws.cell(1, 3).value
+        if not col3_val:
+            ws.update_cell(1, 3, "Año_Inicio")
+        col4_val = ws.cell(1, 4).value
+        if not col4_val:
+            ws.update_cell(1, 4, "Año_Fin")
+    except Exception:
+        pass
+
+    val_ini = str(anio_inicio).strip() if anio_inicio is not None else ""
+    val_fin = str(anio_fin).strip() if anio_fin is not None else ""
+
     _con_reintentos("agregar filiacion", ws.append_row,
-                    [autor, filiacion], value_input_option="USER_ENTERED")
-    print(f"  [INFO] Filiación agregada al diccionario: {autor} -> {filiacion[:60]}...")
+                    [autor, filiacion, val_ini, val_fin], value_input_option="USER_ENTERED")
+    print(f"  [INFO] Filiación agregada al diccionario: {autor} -> {filiacion[:60]}... ({val_ini or '?'}-{val_fin or '?'})")
 
     if dicc_actual is not None:
         dicc_actual.setdefault(clave, []).append(filiacion)  # mantener cache al día
+        detalles = dicc_actual.setdefault("__detalles__", {})
+        detalles.setdefault(clave, []).append({
+            "filiacion": filiacion,
+            "inicio": int(val_ini) if val_ini.isdigit() else None,
+            "fin": int(val_fin) if val_fin.isdigit() else None,
+        })
         # mantener también el índice de nombres, para que un autor nuevo pueda
         # servir para completar abreviaturas en el mismo run
         try:
@@ -456,3 +508,85 @@ def agregar_filiacion(autor: str, filiacion: str, dicc_actual: dict | None = Non
         except Exception:
             pass
     return True
+
+
+def actualizar_fechas_filiacion(ws, row_index: int,
+                                anio_inicio: int | str | None = None,
+                                anio_fin: int | str | None = None,
+                                filiacion_nueva: str | None = None):
+    """Actualiza Año_Inicio (col C) y Año_Fin (col D) y opcionalmente Filiacion (col B)
+    para una fila dada de la hoja Filiaciones."""
+    # Asegurar encabezados en fila 1 si están ausentes
+    try:
+        if not ws.cell(1, 3).value:
+            ws.update_cell(1, 3, "Año_Inicio")
+        if not ws.cell(1, 4).value:
+            ws.update_cell(1, 4, "Año_Fin")
+    except Exception:
+        pass
+
+    if filiacion_nueva:
+        _con_reintentos(f"actualizar filiacion fila {row_index}",
+                        ws.update_cell, row_index, 2, filiacion_nueva)
+    if anio_inicio is not None:
+        _con_reintentos(f"actualizar anio inicio fila {row_index}",
+                        ws.update_cell, row_index, 3, str(anio_inicio))
+    if anio_fin is not None:
+        _con_reintentos(f"actualizar anio fin fila {row_index}",
+                        ws.update_cell, row_index, 4, str(anio_fin))
+
+
+def obtener_filas_filiaciones(sheet_id: str | None = None, solo_vacios: bool = True, limite: int = 0):
+    """Devuelve una lista de dicts con información de las filas de la hoja Filiaciones:
+    [
+        {
+            "row_index": int,
+            "autor": str,
+            "filiacion": str,
+            "anio_inicio": str,
+            "anio_fin": str,
+        },
+        ...
+    ]
+    """
+    ws = _hoja(HOJA_FILIACIONES, sheet_id=sheet_id)
+    valores = _con_reintentos(f"leer '{ws.title}'", ws.get_all_values)
+    if not valores or len(valores) <= 1:
+        return [], ws
+
+    # Asegurar encabezados de columnas C y D si faltan
+    headers = valores[0]
+    if len(headers) < 3 or not headers[2].strip():
+        try:
+            ws.update_cell(1, 3, "Año_Inicio")
+        except Exception:
+            pass
+    if len(headers) < 4 or not headers[3].strip():
+        try:
+            ws.update_cell(1, 4, "Año_Fin")
+        except Exception:
+            pass
+
+    filas_resultado = []
+    for idx, row in enumerate(valores[1:], start=2):
+        autor = row[0].strip() if len(row) > 0 else ""
+        if not autor:
+            continue
+        filiacion = row[1].strip() if len(row) > 1 else ""
+        inicio = row[2].strip() if len(row) > 2 else ""
+        fin = row[3].strip() if len(row) > 3 else ""
+
+        if solo_vacios and inicio and fin:
+            continue
+
+        filas_resultado.append({
+            "row_index": idx,
+            "autor": autor,
+            "filiacion": filiacion,
+            "anio_inicio": inicio,
+            "anio_fin": fin,
+        })
+        if limite > 0 and len(filas_resultado) >= limite:
+            break
+
+    return filas_resultado, ws

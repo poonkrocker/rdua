@@ -534,9 +534,45 @@ def _nombre_canonico(entrada) -> str:
     return str(entrada or "")
 
 
+def _filtrar_filiaciones_por_anio(filiaciones_todas: list, detalles: list | None, anio: int | str | None) -> list:
+    """Filtra o prioriza las filiaciones de un autor para un año determinado.
+    Si anio es None o inválido, o no hay detalles temporales, devuelve la lista completa.
+    Si ninguna coincide con el año exacto, devuelve la lista completa para no perder
+    la referencia."""
+    if not filiaciones_todas:
+        return []
+    if not anio:
+        return list(filiaciones_todas)
+
+    m = re.search(r"\b(19\d\d|20\d\d)\b", str(anio))
+    if not m:
+        return list(filiaciones_todas)
+    a = int(m.group(1))
+
+    if not detalles:
+        return list(filiaciones_todas)
+
+    coincidentes = []
+    for d in detalles:
+        fil = d.get("filiacion")
+        if not fil:
+            continue
+        ini = d.get("inicio")
+        fin = d.get("fin")
+        valido_ini = (ini is None) or (ini <= a)
+        valido_fin = (fin is None) or (a <= fin)
+        if valido_ini and valido_fin:
+            coincidentes.append(fil)
+
+    return coincidentes if coincidentes else list(filiaciones_todas)
+
+
 def buscar_en_diccionario(nombre: str, dicc: dict,
-                          minimo: str = NIVEL_POR_DEFECTO) -> dict:
+                          minimo: str = NIVEL_POR_DEFECTO,
+                          anio: int | str | None = None) -> dict:
     """Busca un autor en el diccionario de filiaciones tolerando abreviaturas.
+    Si se proporciona `anio`, prioriza o filtra las filiaciones que corresponden
+    al año dado (según Año_Inicio y Año_Fin registrados).
 
     Devuelve:
       {
@@ -557,13 +593,17 @@ def buscar_en_diccionario(nombre: str, dicc: dict,
         return vacio
 
     idx = dicc.get("__nombres__") or {}
+    detalles_dict = dicc.get("__detalles__") or {}
     ap_norm, tokens = _desarmar(original)
     if not ap_norm or not tokens:
         # Sin coma no se puede separar apellido de nombre: solo match exacto.
-        filiaciones = dicc.get(clave_autor(original)) or []
-        if filiaciones:
+        c = clave_autor(original)
+        filiaciones_todas = dicc.get(c) or []
+        if filiaciones_todas:
+            detalles = detalles_dict.get(c, [])
+            fils = _filtrar_filiaciones_por_anio(filiaciones_todas, detalles, anio)
             return {**vacio, "nivel": "exacta", "encontrado": True,
-                    "candidatos": [original], "filiaciones": list(filiaciones)}
+                    "candidatos": [original], "filiaciones": fils}
         return vacio
 
     piso = NIVELES.get((minimo or "").lower(), NIVELES[NIVEL_POR_DEFECTO])
@@ -588,14 +628,19 @@ def buscar_en_diccionario(nombre: str, dicc: dict,
         return {**vacio, "nivel": mejor, "ambiguo": True, "candidatos": candidatos}
 
     canonico = candidatos[0]
+    c_canonico = clave_autor(canonico)
+    filiaciones_todas = dicc.get(c_canonico) or []
+    detalles = detalles_dict.get(c_canonico, [])
+    fils = _filtrar_filiaciones_por_anio(filiaciones_todas, detalles, anio)
+
     return {"nombre": canonico, "nivel": mejor, "encontrado": True,
             "ambiguo": False, "candidatos": candidatos,
-            "filiaciones": list(dicc.get(clave_autor(canonico)) or [])}
+            "filiaciones": fils}
 
 
-def completar_desde_diccionario(nombre: str, dicc: dict) -> dict:
+def completar_desde_diccionario(nombre: str, dicc: dict, anio: int | str | None = None) -> dict:
     """Compatibilidad hacia atras: envoltorio de buscar_en_diccionario()."""
-    r = buscar_en_diccionario(nombre, dicc)
+    r = buscar_en_diccionario(nombre, dicc, anio=anio)
     return {"nombre": r["nombre"],
             "completado": r["encontrado"] and r["nombre"] != (nombre or "").strip(),
             "ambiguo": r["ambiguo"], "candidatos": r["candidatos"]}

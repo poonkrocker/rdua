@@ -10,6 +10,8 @@ Fuentes consultadas (todas públicas, sin login):
 El texto crudo encontrado se le pasa a claude_steps.generar_filiacion() como
 contexto adicional, junto con lo que ya se extrajo del PDF.
 """
+from __future__ import annotations
+
 import urllib.parse
 import urllib.request
 import re
@@ -65,3 +67,90 @@ def buscar_filiacion_web(autor: str, titulo_trabajo: str = "") -> str:
             contexto.append(f"Búsqueda: {c}\n{resultado}")
 
     return "\n\n".join(contexto) if contexto else ""
+
+
+def buscar_trayectoria_openalex(autor: str) -> dict:
+    """Consulta la API abierta de OpenAlex para obtener el perfil del autor y
+    sus afiliaciones institucionales con sus respectivos años de actividad."""
+    import json
+    # Convertir "Apellido, Nombre" -> "Nombre Apellido" para búsqueda óptima
+    partes = [p.strip() for p in (autor or "").split(",") if p.strip()]
+    nombre_busqueda = " ".join(reversed(partes)) if len(partes) > 1 else (autor or "")
+    if not nombre_busqueda:
+        return {}
+
+    url = "https://api.openalex.org/authors?search=" + urllib.parse.quote(nombre_busqueda)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "rdu-enricher/1.0 (mailto:biblioteca@unc.edu.ar)",
+        "Accept": "application/json",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            results = data.get("results", [])
+            if not results:
+                return {}
+            # Tomar el resultado más relevante (con mayor número de obras / relevancia)
+            autor_match = results[0]
+            afiliaciones = []
+            for aff in autor_match.get("affiliations", []):
+                inst = aff.get("institution", {})
+                anios = sorted(aff.get("years", []))
+                afiliaciones.append({
+                    "institucion": inst.get("display_name", ""),
+                    "pais": inst.get("country_code", ""),
+                    "anios": anios,
+                    "inicio": anios[0] if anios else None,
+                    "fin": anios[-1] if anios else None,
+                })
+            return {
+                "nombre_oficial": autor_match.get("display_name", ""),
+                "obras": autor_match.get("works_count", 0),
+                "afiliaciones": afiliaciones,
+            }
+    except Exception as e:
+        print(f"  [DEBUG] OpenAlex query falló para '{nombre_busqueda}': {e}")
+        return {}
+
+
+def buscar_filiacion_temporal_web(autor: str, filiacion_actual: str = "", anio: int | str | None = None) -> str:
+    """Arma consultas orientadas a determinar la trayectoria temporal y afiliación
+    institucional de un autor combinando la API científica OpenAlex y búsqueda web."""
+    contexto = []
+
+    # 1. Fuente primaria estructurada: OpenAlex
+    alex = buscar_trayectoria_openalex(autor)
+    if alex and alex.get("afiliaciones"):
+        lineas = [f"Perfil académico OpenAlex: {alex.get('nombre_oficial')} ({alex.get('obras')} obras registradas)"]
+        lineas.append("Afiliaciones documentadas por publicaciones científicas:")
+        for aff in alex["afiliaciones"][:10]:
+            anios_str = f"años: {aff['anios']}" if aff['anios'] else "sin años registrados"
+            lineas.append(f" - {aff['institucion']} ({aff['pais']}): {anios_str}")
+        contexto.append("\n".join(lineas))
+
+    # 2. Búsqueda web complementaria
+    partes = [p.strip() for p in (autor or "").split(",") if p.strip()]
+    nombre_dir = " ".join(reversed(partes)) if len(partes) > 1 else (autor or "")
+
+    consultas = [
+        f'"{nombre_dir}" CONICET OR "Universidad Nacional"',
+    ]
+    if filiacion_actual:
+        partes_fil = re.sub(r"^Fil:\s*[^.]+\.\s*", "", filiacion_actual)
+        inst_limpia = " ".join(partes_fil.replace(";", " ").replace(".", " ").split()[:6])
+        if inst_limpia:
+            consultas.append(f'"{nombre_dir}" {inst_limpia}')
+
+    if anio:
+        m = re.search(r"\b(19\d\d|20\d\d)\b", str(anio))
+        if m:
+            consultas.append(f'"{nombre_dir}" {m.group(1)} filiación OR UNC')
+
+    for c in consultas:
+        resultado = _buscar_web(c, max_resultados=3)
+        if resultado:
+            contexto.append(f"Búsqueda web ({c}):\n{resultado}")
+
+    return "\n\n".join(contexto) if contexto else ""
+
+

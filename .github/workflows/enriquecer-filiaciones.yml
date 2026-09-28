@@ -1,0 +1,80 @@
+name: Enriquecer filiaciones con Gemini Flash
+
+on:
+  workflow_dispatch:
+    inputs:
+      modo:
+        description: "Modo de enriquecimiento"
+        type: choice
+        options:
+          - "filiaciones"
+          - "cola"
+        default: "filiaciones"
+        required: true
+      limite:
+        description: "Cantidad máxima de entradas a procesar (ej. 10 o 50; 0 = todas las pendientes)"
+        required: false
+        default: "10"
+      dry_run:
+        description: "Modo simulación (true = NO escribe en Google Sheets; solo genera reporte CSV)"
+        type: boolean
+        required: true
+        default: true
+      solo_vacios:
+        description: "Solo procesar entradas sin años asignados en la hoja Filiaciones"
+        type: boolean
+        required: false
+        default: true
+      reprocesar_todo:
+        description: "Reprocesar todas las entradas aunque ya tengan años"
+        type: boolean
+        required: false
+        default: false
+      gemini_model:
+        description: "Modelo de Gemini a utilizar"
+        required: false
+        default: "gemini-3.6-flash"
+
+jobs:
+  enriquecer-filiaciones:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar enriquecimiento de filiaciones
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          DRY_RUN_FLAG=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+          fi
+
+          REPROCESAR_FLAG=""
+          if [ "${{ github.event.inputs.reprocesar_todo }}" = "true" ]; then
+            REPROCESAR_FLAG="--reprocesar-todo"
+          fi
+
+          python scripts/enriquecer_filiaciones.py \
+            --modo "${{ github.event.inputs.modo }}" \
+            --limite "${{ github.event.inputs.limite }}" \
+            --gemini-model "${{ github.event.inputs.gemini_model }}" \
+            $DRY_RUN_FLAG \
+            $REPROCESAR_FLAG
+
+      - name: Subir reporte CSV
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reporte-enriquecimiento-filiaciones
+          path: reportes/*.csv
