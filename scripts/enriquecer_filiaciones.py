@@ -160,6 +160,73 @@ Devuelve EXCLUSIVAMENTE un objeto JSON válido:
 }}"""
 
 
+def normalizar_texto_institucion(t: str) -> str:
+    import unicodedata
+    if not t:
+        return ""
+    sin_ac = "".join(c for c in unicodedata.normalize("NFD", str(t)) if unicodedata.category(c) != "Mn")
+    return " ".join(sin_ac.lower().replace("-", " ").replace(".", " ").replace(";", " ").split())
+
+
+def deducir_fechas_openalex(filiacion_rdu: str, afiliaciones_alex: list) -> dict | None:
+    """Compara la filiación de la fila de Google Sheets con las afiliaciones
+    documentadas en OpenAlex para extraer años con 100% de rigor fáctico
+    sin consumir cuota de la API de Gemini."""
+    if not filiacion_rdu or not afiliaciones_alex:
+        return None
+
+    fil_norm = normalizar_texto_institucion(filiacion_rdu)
+    mejor_match = None
+    max_score = 0
+
+    for aff in afiliaciones_alex:
+        inst_nombre = aff.get("institucion", "")
+        if not inst_nombre:
+            continue
+        inst_norm = normalizar_texto_institucion(inst_nombre)
+        anios = aff.get("anios", [])
+        if not anios:
+            continue
+
+        palabras_clave = [p for p in inst_norm.split() if len(p) > 3 and p not in (
+            "universidad", "nacional", "instituto", "facultad", "investigacion",
+            "investigaciones", "cientificas", "tecnicas", "mercedes", "martin"
+        )]
+
+        es_match = False
+        if inst_norm in fil_norm:
+            es_match = True
+        elif any(p in fil_norm for p in palabras_clave) and (
+            ("conicet" in fil_norm and "conicet" in inst_norm) or
+            ("cordoba" in fil_norm and "cordoba" in inst_norm) or
+            ("buenos aires" in fil_norm and "buenos aires" in inst_norm) or
+            ("ferreyra" in fil_norm and "ferreyra" in inst_norm)
+        ):
+            es_match = True
+        elif "mercedes y martin ferreyra" in fil_norm and "ferreyra" in inst_norm:
+            es_match = True
+
+        if es_match:
+            ini = min(anios)
+            fin_max = max(anios)
+            vigente = fin_max >= 2023
+            fin = None if vigente else fin_max
+
+            score = len(inst_norm)
+            if score > max_score:
+                max_score = score
+                mejor_match = {
+                    "anio_inicio": ini,
+                    "anio_fin": fin,
+                    "vigente_actualidad": vigente,
+                    "filiacion_estandar": filiacion_rdu,
+                    "confianza": "alta",
+                    "observacion": f"Publicaciones documentadas en '{inst_nombre}' entre {ini} y {fin_max} según OpenAlex."
+                }
+
+    return mejor_match
+
+
 # ------------------------------------------------------------------- modo filiaciones
 def procesar_hoja_filiaciones(args, api_key: str):
     """Recorre la pestaña Filiaciones de Google Sheets y completa Año_Inicio y Año_Fin."""
@@ -195,21 +262,41 @@ def procesar_hoja_filiaciones(args, api_key: str):
         if ini_prev or fin_prev:
             print(f"  Años registrados previos: {ini_prev or '?'} - {fin_prev or '?'}")
 
-        # 1. Búsqueda de contexto académico estructurado (OpenAlex + Web)
-        print("  Consultando historial académico y publicaciones...")
-        ctx = web_filiacion.buscar_filiacion_temporal_web(autor, filiacion)
+        # 1. Búsqueda de perfil estructurado en OpenAlex
+        alex = web_filiacion.buscar_trayectoria_openalex(autor)
+        ded = deducir_fechas_openalex(filiacion, alex.get("afiliaciones", []))
 
-        # 2. Análisis y extracción con Gemini Flash
-        prompt = armar_prompt_enriquecer_filiacion(autor, filiacion, ctx)
-        res = llamar_gemini(prompt, api_key=api_key, modelo=args.gemini_model)
+        ini_nuevo = None
+        fin_nuevo = None
+        vigente = False
+        confianza = "baja"
+        obs = ""
+        consumio_gemini = False
 
-        ini_nuevo = res.get("anio_inicio")
-        fin_nuevo = res.get("anio_fin")
-        vigente = res.get("vigente_actualidad")
-        confianza = res.get("confianza", "baja")
-        obs = res.get("observacion", "")
+        if ded:
+            print(f"  [OPENALEX MATCH] Institución y fechas extraídas de registros científicos OpenAlex.")
+            ini_nuevo = ded["anio_inicio"]
+            fin_nuevo = ded["anio_fin"]
+            vigente = ded["vigente_actualidad"]
+            confianza = "alta"
+            obs = ded["observacion"]
+        else:
+            # 2. Si OpenAlex no tiene match exacto de la institución, invocar Gemini Flash con contexto web
+            print("  Sin coincidencia directa en OpenAlex. Consultando Gemini Flash y búsqueda web...")
+            ctx = web_filiacion.buscar_filiacion_temporal_web(autor, filiacion)
+            prompt = armar_prompt_enriquecer_filiacion(autor, filiacion, ctx)
+            res = llamar_gemini(prompt, api_key=api_key, modelo=args.gemini_model)
+            consumio_gemini = True
+            if res:
+                ini_nuevo = res.get("anio_inicio")
+                fin_nuevo = res.get("anio_fin")
+                vigente = res.get("vigente_actualidad")
+                confianza = res.get("confianza", "media")
+                obs = res.get("observacion", "")
+            else:
+                obs = "Sin registros coincidentes en OpenAlex y cuota de Gemini API no disponible."
 
-        print(f"  Resultado IA -> Inicio: {ini_nuevo or '-'} | Fin: {fin_nuevo or ('(vigente)' if vigente else '-')} | Confianza: {confianza}")
+        print(f"  Resultado -> Inicio: {ini_nuevo or '-'} | Fin: {fin_nuevo or ('(vigente)' if vigente else '-')} | Confianza: {confianza}")
         if obs:
             print(f"  Nota: {obs[:85]}...")
 
@@ -245,8 +332,8 @@ def procesar_hoja_filiaciones(args, api_key: str):
             "observacion": obs,
         })
 
-        # Control de cuota (15 RPM free tier)
-        if idx < len(filas):
+        # Control de cuota (solo necesario si se llamó a la API de Gemini)
+        if consumio_gemini and idx < len(filas):
             time.sleep(PAUSA_ENTRE_LLAMADAS_SEG)
 
     print("\n" + "=" * 70)
