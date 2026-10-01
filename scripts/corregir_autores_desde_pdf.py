@@ -1137,6 +1137,7 @@ def procesar_flujo(
     google_sheet_id: str = "",
     reprocesar_todo: bool = False,
     dry_run: bool = False,
+    devolver_al_pool: bool = False,
     limite: int = 0,
     pausa_segundos: float = 0.5,
     email: str = "",
@@ -1423,15 +1424,18 @@ def procesar_flujo(
                             if not pool_id:
                                 raise RuntimeError(f"No se encontró pooltask para el ítem {uuid}")
                             claimed_id = asumir_tarea(client, pool_id)
-                            print(f"  [1/3] Tarea asumida (claimedtask_id: {claimed_id})")
+                            print(f"  [1/2] Tarea asumida (claimedtask_id: {claimed_id})")
                         else:
-                            print(f"  [1/3] Tarea ya estaba asumida (claimedtask_id: {claimed_id})")
+                            print(f"  [1/2] Tarea ya estaba asumida (claimedtask_id: {claimed_id})")
 
                         marcar_adjunto_no_corresponde(client, wf_id, motivo)
-                        print(f"  [2/3] Resumen marcado con '[ADJUNTO NO CORRESPONDE]'. Autores y título intactos.")
+                        print(f"  [2/2] Resumen marcado con '[ADJUNTO NO CORRESPONDE]'. Autores y título intactos.")
 
-                        devolver_tarea_al_pool(client, claimed_id)
-                        print(f"  [3/3] Tarea devuelta al pool general.")
+                        if devolver_al_pool:
+                            devolver_tarea_al_pool(client, claimed_id)
+                            print(f"  [POOL] Tarea devuelta al pool general.")
+                        else:
+                            print(f"  [ASIGNADA] La tarea permanece asignada al usuario (claimedtask_id: {claimed_id}).")
 
                         reportar_col_c(f"[ADJUNTO NO CORRESPONDE] {motivo}")
                         filas_reporte.append({
@@ -1556,9 +1560,9 @@ def procesar_flujo(
                             if not pool_id:
                                 raise RuntimeError(f"No se encontró pooltask para el ítem {uuid}")
                             claimed_id = asumir_tarea(client, pool_id)
-                            print(f"  [1/3] Tarea asumida (claimedtask_id: {claimed_id})")
+                            print(f"  [1/2] Tarea asumida (claimedtask_id: {claimed_id})")
                         else:
-                            print(f"  [1/3] Tarea ya estaba asumida (claimedtask_id: {claimed_id})")
+                            print(f"  [1/2] Tarea ya estaba asumida (claimedtask_id: {claimed_id})")
 
                         t_fin, a_fin, r_fin = aplicar_cambios_workflowitem(
                             client=client,
@@ -1569,10 +1573,13 @@ def procesar_flujo(
                             autores_actuales=autores_rdu,
                             resumen_modificaciones=modificaciones,
                         )
-                        print("  [2/3] Anotación de [PDF SIN AUTOR] aplicada en RDU.")
+                        print("  [2/2] Anotación de [PDF SIN AUTOR] aplicada en RDU.")
 
-                        devolver_tarea_al_pool(client, claimed_id)
-                        print("  [3/3] Tarea devuelta al pool general.")
+                        if devolver_al_pool:
+                            devolver_tarea_al_pool(client, claimed_id)
+                            print("  [POOL] Tarea devuelta al pool general.")
+                        else:
+                            print(f"  [ASIGNADA] La tarea permanece asignada al usuario (claimedtask_id: {claimed_id}).")
 
                         reportar_col_c(modificaciones)
                         filas_reporte.append({
@@ -1646,6 +1653,20 @@ def procesar_flujo(
             hay_cambios = cambio_titulo or cambio_autores
             if not hay_cambios:
                 print("  [OK] Metadatos coincidentes (formato institucional RDU y filiaciones validadas), NO se requieren modificaciones.")
+                if not dry_run:
+                    try:
+                        pool_id = item.get("pooltask_id")
+                        claimed_id = item.get("claimedtask_id")
+                        if not pool_id and not claimed_id:
+                            pool_id = buscar_pooltask_id(client, uuid)
+                        if not claimed_id and pool_id:
+                            claimed_id = asumir_tarea(client, pool_id)
+                            print(f"  [ASIGNADA] Tarea asumida y asignada al usuario (claimedtask_id: {claimed_id}).")
+                        elif claimed_id:
+                            print(f"  [ASIGNADA] La tarea ya estaba asignada al usuario (claimedtask_id: {claimed_id}).")
+                    except Exception as e_asum:
+                        print(f"  [WARN] No se pudo verificar/asumir tarea: {e_asum}", file=sys.stderr)
+
                 reportar_col_c("Sin cambios requeridos (metadatos coincidentes)")
                 filas_reporte.append({
                     "Fecha": datetime.now().isoformat(),
@@ -1718,9 +1739,9 @@ def procesar_flujo(
                         if not pool_id:
                             raise RuntimeError(f"No se encontró pooltask para el ítem {uuid}")
                         claimed_id = asumir_tarea(client, pool_id)
-                        print(f"  [1/3] Tarea asumida (claimedtask_id: {claimed_id})")
+                        print(f"  [1/2] Tarea asumida (claimedtask_id: {claimed_id})")
                     else:
-                        print(f"  [1/3] Tarea ya estaba asumida (claimedtask_id: {claimed_id})")
+                        print(f"  [1/2] Tarea ya estaba asumida (claimedtask_id: {claimed_id})")
 
                     t_fin, a_fin, r_fin = aplicar_cambios_workflowitem(
                         client=client,
@@ -1731,10 +1752,13 @@ def procesar_flujo(
                         autores_actuales=autores_rdu,
                         resumen_modificaciones=modificaciones,
                     )
-                    print("  [2/3] Cambios aplicados con éxito en metadatos y resumen.")
+                    print("  [2/2] Cambios aplicados con éxito en metadatos y resumen.")
 
-                    devolver_tarea_al_pool(client, claimed_id)
-                    print("  [3/3] Tarea devuelta al pool general.")
+                    if devolver_al_pool:
+                        devolver_tarea_al_pool(client, claimed_id)
+                        print("  [POOL] Tarea devuelta al pool general.")
+                    else:
+                        print(f"  [ASIGNADA] La tarea permanece asignada al usuario (claimedtask_id: {claimed_id}).")
 
                     reportar_col_c(modificaciones)
                     filas_reporte.append({
@@ -1748,7 +1772,7 @@ def procesar_flujo(
                         "Autores_Sin_Filiacion": texto_col_d,
                         "Buscar_Filiaciones": texto_col_e,
                         "Modificaciones": modificaciones,
-                        "Accion": "MODIFICADO_Y_DEVUELTO_AL_POOL",
+                        "Accion": "MODIFICADO_Y_DEVUELTO_AL_POOL" if devolver_al_pool else "MODIFICADO_Y_ASIGNADO",
                         "Link_Workflow": item.get("link_workflow") or link_origen,
                         "Link_Item": item.get("link_item") or "",
                     })
@@ -1802,6 +1826,7 @@ def main():
     parser.add_argument("--sheet-id", default=os.environ.get("GOOGLE_SHEET_ID", "1gh2n-gbxiSzrCQZG4-Pkq52eMmbLzJiGnb_6vP4zEQU"), help="ID del spreadsheet de Google Sheets")
     parser.add_argument("--reprocesar-todo", action="store_true", default=os.environ.get("REPROCESAR_TODO", "0") in ("1", "true", "True"), help="Reprocesar filas de la cola aunque ya tengan contenido en la Columna C")
     parser.add_argument("--dry-run", action="store_true", default=os.environ.get("DRY_RUN", "0") in ("1", "true", "True"), help="Modo simulación sin escribir en RDU")
+    parser.add_argument("--devolver-al-pool", action="store_true", default=os.environ.get("DEVOLVER_AL_POOL", "0") in ("1", "true", "True"), help="Devolver la tarea al pool general tras procesar (default: False, la tarea permanece asignada)")
     parser.add_argument("--limite", type=int, default=int(os.environ.get("LIMITE", "0")), help="Límite de ítems a procesar (0 = sin límite)")
     parser.add_argument("--model", default=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"), help="Modelo de DeepSeek (default deepseek-chat)")
     parser.add_argument("--output", default=os.environ.get("ARCHIVO_REPORTE", ""), help="Ruta del CSV de salida")
@@ -1823,6 +1848,7 @@ def main():
         google_sheet_id=args.sheet_id,
         reprocesar_todo=args.reprocesar_todo,
         dry_run=args.dry_run,
+        devolver_al_pool=args.devolver_al_pool,
         limite=args.limite,
         email=email,
         password=password,
