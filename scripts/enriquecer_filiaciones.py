@@ -381,10 +381,13 @@ def procesar_hoja_cola(args, api_key: str):
     for row_idx, r in enumerate(filas_cola[1:], start=2):
         link = r[idx_link].strip() if len(r) > idx_link else ""
         faltantes_str = r[idx_col_d].strip() if len(r) > idx_col_d else ""
-        if not faltantes_str:
+        if not faltantes_str or "sin autor" in faltantes_str.lower():
             continue
+        # Limpiar posibles prefijos como "(PDF sin autor)" o "Falta filiación:"
+        faltantes_limpio = re.sub(r"^\(.*?sin autor.*?\)\s*", "", faltantes_str, flags=re.I).strip()
+        faltantes_limpio = re.sub(r"^falta filiaci[oó]n:\s*", "", faltantes_limpio, flags=re.I).strip()
         # Autores separados por punto y coma
-        autores = [a.strip() for a in faltantes_str.split(";") if a.strip()]
+        autores = [a.strip() for a in faltantes_limpio.split(";") if a.strip() and "sin autor" not in a.lower()]
         for a in autores:
             candidatos_a_investigar.append({
                 "row_cola": row_idx,

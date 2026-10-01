@@ -787,13 +787,24 @@ def consultar_deepseek(client_ai: OpenAI, model: str, titulo_rdu: str, autores_r
     system_prompt = (
         "Sos un catalogador bibliográfico experto en el Repositorio Digital Universitario (RDU - Universidad Nacional de Córdoba, Argentina).\n"
         "Tu tarea es cotejar los metadatos cargados en RDU (Título y Autores) contra el texto real de las primeras páginas del documento adjunto (PDF).\n\n"
-        "CRÍTICO - EVALUACIÓN DE CORRESPONDENCIA:\n"
+        "CRÍTICO - EVALUACIÓN DE CORRESPONDENCIA Y TIPO DE DOCUMENTO:\n"
         "1. ¿El documento adjunto corresponde realmente al trabajo registrado en RDU, o se adjuntó un DOCUMENTO EQUIVOCADO?\n"
-        "   - Si el título del PDF y los autores del PDF NO TIENEN NADA QUE VER con los metadatos de RDU (artículo completamente diferente),\n"
+        "   - Si el título del PDF y el contenido temático NO TIENEN NADA QUE VER con los metadatos de RDU (artículo completamente diferente),\n"
         "     debes indicar obligatoriamente: 'adjunto_corresponde': false.\n"
         "     En 'motivo_no_corresponde' explica brevemente cuál es el artículo real que viene en el PDF.\n"
-        "   - Si el documento sí es el mismo artículo (aunque tenga autores que no habían sido cargados, nombres con iniciales a completar,\n"
-        "     o pequeñas erratas en el título), indica: 'adjunto_corresponde': true.\n\n"
+        "   - Si el documento sí es el mismo artículo o trabajo (aunque tenga autores que no habían sido cargados, nombres con iniciales a completar,\n"
+        "     pequeñas erratas en el título, o no contenga autores explícitos en el texto por ser nota editorial/institucional), indica: 'adjunto_corresponde': true.\n\n"
+        "2. DETECCIÓN DE DOCUMENTOS SIN AUTOR EN EL PDF:\n"
+        "   - Evalúa si en el texto del PDF figuran nombres de autores reales del trabajo, o si el documento NO contiene autor firmado\n"
+        "     (por ejemplo: notas editoriales, presentaciones institucionales, prólogos, notas de redacción o dirección, cartas al editor, índices, reseñas breves o textos anónimos sin firma de autor).\n"
+        "   - PRECAUCIÓN: No confundas nombres de miembros del comité editorial, directores de revista o impresores con autores del documento si el texto en sí no lleva firma de autor.\n"
+        "   - Si en el PDF NO figura nombre de autor:\n"
+        "     * 'pdf_sin_autor': true\n"
+        "     * 'motivo_sin_autor': 'Breve explicación (ej: El PDF no contiene nombre de autor; es una nota editorial/institucional sin firma)'\n"
+        "     * 'autores_corregidos': []\n"
+        "   - Si en el PDF SÍ figuran autores:\n"
+        "     * 'pdf_sin_autor': false\n"
+        "     * 'motivo_sin_autor': ''\n\n"
         "Instrucciones si 'adjunto_corresponde' es true:\n"
         "1. TÍTULO (REGLAS INSTITUCIONALES RDU):\n"
         "   - Formato obligatorio: 'formato oración' (mayúscula solo al inicio del título, resto en minúsculas salvo nombres propios y siglas como UNC, CONICET, etc.).\n"
@@ -802,7 +813,7 @@ def consultar_deepseek(client_ai: OpenAI, model: str, titulo_rdu: str, autores_r
         "   - SIN PUNTO FINAL.\n"
         "   - NUNCA cambies ' : ' por ': ' (en RDU el espacio antes de los dos puntos es la norma institucional oficial).\n"
         "   - Si el título en RDU ya cumple esto o es equivalente, consérvalo tal cual.\n\n"
-        "2. REGLA ESTRICTA PARA AUTORES:\n"
+        "2. REGLA ESTRICTA PARA AUTORES (cuando 'pdf_sin_autor' es false):\n"
         "   - Formato OBLIGATORIO: SOLO 'Apellido, Nombre' (para que coincida con el registro institucional de filiaciones en Sheets).\n"
         "   - NUNCA agregues guiones a apellidos compuestos ni iniciales o segundos nombres adicionales si el autor ya figura en RDU o coincide con él.\n"
         "     * Ejemplo: Si en RDU figura 'Flores Kanter, Ezequiel' y en el PDF dice 'Flores-Kanter, Pablo Ezequiel', NO agregues guion ni segundo nombre. Conserva exactamente 'Flores Kanter, Ezequiel'.\n"
@@ -823,6 +834,8 @@ def consultar_deepseek(client_ai: OpenAI, model: str, titulo_rdu: str, autores_r
         "{\n"
         '  "adjunto_corresponde": true o false,\n'
         '  "motivo_no_corresponde": "Breve explicación si adjunto_corresponde es false, o vacío",\n'
+        '  "pdf_sin_autor": true o false,\n'
+        '  "motivo_sin_autor": "Breve explicación si pdf_sin_autor es true, o vacío",\n'
         '  "titulo_corregido": "Título corregido o idéntico",\n'
         '  "autores_corregidos": ["Apellido, Nombre", ...],\n'
         '  "hubo_cambios": true o false,\n'
@@ -855,17 +868,27 @@ def consultar_deepseek(client_ai: OpenAI, model: str, titulo_rdu: str, autores_r
             limpio = raw.replace("```json", "").replace("```", "").strip()
             m = re.search(r"\{.*\}", limpio, re.DOTALL)
             res_dict = json.loads(m.group(0)) if m else json.loads(limpio)
-            if isinstance(res_dict, dict) and "autores_corregidos" in res_dict:
-                # Depurar autores devueltos para quitar iniciales secundarias
-                res_dict["autores_corregidos"] = [
-                    depurar_autor_sin_iniciales(a) for a in (res_dict.get("autores_corregidos") or []) if a
-                ]
+            if isinstance(res_dict, dict):
+                res_dict.setdefault("pdf_sin_autor", False)
+                res_dict.setdefault("motivo_sin_autor", "")
+                if "autores_corregidos" in res_dict:
+                    # Depurar autores devueltos para quitar iniciales secundarias
+                    res_dict["autores_corregidos"] = [
+                        depurar_autor_sin_iniciales(a) for a in (res_dict.get("autores_corregidos") or []) if a
+                    ]
+                # Salvaguarda: si no devolvió autores y en cambios o resumen menciona que el PDF no tiene autor
+                if not res_dict.get("autores_corregidos") and not res_dict.get("pdf_sin_autor"):
+                    txt_diag = f"{res_dict.get('resumen_modificaciones', '')} {res_dict.get('cambios_autores', '')}".lower()
+                    if any(k in txt_diag for k in ["sin autor", "no contiene autor", "no figura autor", "no se menciona autor", "anónimo"]):
+                        res_dict["pdf_sin_autor"] = True
+                        if not res_dict.get("motivo_sin_autor"):
+                            res_dict["motivo_sin_autor"] = "El texto del PDF no contiene nombre de autor"
             return res_dict
         except Exception as e:
             print(f"  [WARN] Falló llamada a DeepSeek (intento {intento}/3): {e}", file=sys.stderr)
             time.sleep(2 * intento)
 
-    return {"adjunto_corresponde": True, "hubo_cambios": False, "error": "No se pudo obtener respuesta estructurada de DeepSeek"}
+    return {"adjunto_corresponde": True, "hubo_cambios": False, "pdf_sin_autor": False, "motivo_sin_autor": "", "error": "No se pudo obtener respuesta estructurada de DeepSeek"}
 
 
 def asumir_tarea(client: httpx.Client, pooltask_id: str) -> str:
@@ -1454,22 +1477,10 @@ def procesar_flujo(
                 continue
 
             # CASO B: EL ADJUNTO SÍ CORRESPONDE AL ARTÍCULO
-            # 1. Canonicalizar autores propuestos contra Filiaciones y RDU
-            autores_propuestos_crudos = analisis.get("autores_corregidos") or autores_rdu
-            autores_canonicos = [
-                canonicalizar_autor(a, autores_rdu, dicc_filiaciones)
-                for a in autores_propuestos_crudos if a
-            ]
+            pdf_sin_autor = bool(analisis.get("pdf_sin_autor"))
+            motivo_sin_autor = (analisis.get("motivo_sin_autor") or "El PDF no contiene nombre de autor en el texto").strip()
 
-            # 2. Evaluar cambios de autores
-            if son_autores_equivalentes(autores_rdu, autores_canonicos):
-                autores_nuevos = list(autores_rdu)
-                cambio_autores = False
-            else:
-                autores_nuevos = autores_canonicos
-                cambio_autores = (autores_nuevos != autores_rdu)
-
-            # 3. Título corregido y estandarizado según normas institucionales RDU
+            # 1. Título corregido y estandarizado según normas institucionales RDU
             # Formato RDU: minúsculas (formato oración), ' : ' entre título y subtítulo,
             # subtítulo en minúscula, sin punto final.
             titulo_propuesto_raw = (analisis.get("titulo_corregido") or titulo_rdu).strip()
@@ -1491,7 +1502,140 @@ def procesar_flujo(
                 titulo_nuevo = titulo_propuesto_std
                 cambio_titulo = True
 
-            # 4. Verificar autores sin filiación en la pestaña Filiaciones para Columna D y E
+            # MANEJO ESPECIAL: PDF SIN AUTOR EN EL TEXTO
+            if pdf_sin_autor:
+                print(f"  [ALERTA] PDF SIN AUTOR: {motivo_sin_autor}")
+                print("  -> Se preservan autores actuales en RDU sin borrarlos automáticamente. Se marcará [PDF SIN AUTOR].")
+
+                det_rdu = f" (en RDU figura: {'; '.join(autores_rdu)})" if autores_rdu else " (sin autor en RDU)"
+                autores_sin_fil = [a for a in autores_rdu if not autor_tiene_filiacion(a, dicc_filiaciones)]
+                texto_col_d = f"(PDF sin autor) Falta filiación: {'; '.join(autores_sin_fil)}" if autores_sin_fil else "PDF sin autor"
+                reportar_col_d(texto_col_d)
+                reportar_col_e("")  # No se buscan filiaciones externas de autores no presentes en el PDF
+
+                if cambio_titulo:
+                    if son_titulos_equivalentes(titulo_rdu, titulo_nuevo):
+                        desc_tit = "se estandarizó el formato del título (minúsculas y ' : ')"
+                    else:
+                        desc_tit = "se corrigió el título según PDF"
+                    modificaciones = f"[PDF SIN AUTOR] Modificaciones: {desc_tit}; {motivo_sin_autor}{det_rdu}"
+                else:
+                    modificaciones = f"[PDF SIN AUTOR] {motivo_sin_autor}{det_rdu}; metadatos de título coincidentes"
+
+                print(f"  [ALERTA PDF SIN AUTOR]: {modificaciones}")
+                if cambio_titulo:
+                    print(f"    - Título: {titulo_rdu} -> {titulo_nuevo}")
+
+                if dry_run:
+                    print("  [SIMULACIÓN] No se escriben cambios en RDU (dry-run activo).")
+                    reportar_col_c(f"[SIMULACIÓN] {modificaciones}")
+                    filas_reporte.append({
+                        "Fecha": datetime.now().isoformat(),
+                        "Workflowitem_ID": wf_id,
+                        "Item_UUID": uuid,
+                        "Titulo_Anterior": titulo_rdu,
+                        "Titulo_Nuevo": titulo_nuevo,
+                        "Autores_Anteriores": "; ".join(autores_rdu),
+                        "Autores_Nuevos": "; ".join(autores_rdu),
+                        "Autores_Sin_Filiacion": texto_col_d,
+                        "Buscar_Filiaciones": "",
+                        "Modificaciones": modificaciones,
+                        "Accion": "SIMULADO_PDF_SIN_AUTOR",
+                        "Link_Workflow": item.get("link_workflow") or link_origen,
+                        "Link_Item": item.get("link_item") or "",
+                    })
+                    conteo_modificados += 1
+                else:
+                    try:
+                        pool_id = item.get("pooltask_id")
+                        claimed_id = item.get("claimedtask_id")
+                        if not pool_id and not claimed_id:
+                            pool_id = buscar_pooltask_id(client, uuid)
+
+                        if not claimed_id:
+                            if not pool_id:
+                                raise RuntimeError(f"No se encontró pooltask para el ítem {uuid}")
+                            claimed_id = asumir_tarea(client, pool_id)
+                            print(f"  [1/3] Tarea asumida (claimedtask_id: {claimed_id})")
+                        else:
+                            print(f"  [1/3] Tarea ya estaba asumida (claimedtask_id: {claimed_id})")
+
+                        t_fin, a_fin, r_fin = aplicar_cambios_workflowitem(
+                            client=client,
+                            workflowitem_id=wf_id,
+                            titulo_nuevo=titulo_nuevo if cambio_titulo else "",
+                            titulo_actual=titulo_rdu,
+                            autores_nuevos=[],
+                            autores_actuales=autores_rdu,
+                            resumen_modificaciones=modificaciones,
+                        )
+                        print("  [2/3] Anotación de [PDF SIN AUTOR] aplicada en RDU.")
+
+                        devolver_tarea_al_pool(client, claimed_id)
+                        print("  [3/3] Tarea devuelta al pool general.")
+
+                        reportar_col_c(modificaciones)
+                        filas_reporte.append({
+                            "Fecha": datetime.now().isoformat(),
+                            "Workflowitem_ID": wf_id,
+                            "Item_UUID": uuid,
+                            "Titulo_Anterior": titulo_rdu,
+                            "Titulo_Nuevo": t_fin or titulo_nuevo,
+                            "Autores_Anteriores": "; ".join(autores_rdu),
+                            "Autores_Nuevos": "; ".join(autores_rdu),
+                            "Autores_Sin_Filiacion": texto_col_d,
+                            "Buscar_Filiaciones": "",
+                            "Modificaciones": modificaciones,
+                            "Accion": "MODIFICADO_PDF_SIN_AUTOR" if cambio_titulo else "MARCADO_PDF_SIN_AUTOR",
+                            "Link_Workflow": item.get("link_workflow") or link_origen,
+                            "Link_Item": item.get("link_item") or "",
+                        })
+                        conteo_modificados += 1
+                    except Exception as e:
+                        conteo_errores += 1
+                        print(f"  [ERROR] Falló la actualización de {wf_id}: {e}", file=sys.stderr)
+                        reportar_col_c(f"ERROR: {e}")
+                        filas_reporte.append({
+                            "Fecha": datetime.now().isoformat(),
+                            "Workflowitem_ID": wf_id,
+                            "Item_UUID": uuid,
+                            "Titulo_Anterior": titulo_rdu,
+                            "Titulo_Nuevo": titulo_nuevo,
+                            "Autores_Anteriores": "; ".join(autores_rdu),
+                            "Autores_Nuevos": "; ".join(autores_rdu),
+                            "Autores_Sin_Filiacion": texto_col_d,
+                            "Buscar_Filiaciones": "",
+                            "Modificaciones": f"ERROR: {e}",
+                            "Accion": "ERROR",
+                            "Link_Workflow": item.get("link_workflow") or link_origen,
+                            "Link_Item": item.get("link_item") or "",
+                        })
+
+                time.sleep(pausa_segundos)
+                if limite > 0 and conteo_modificados >= limite:
+                    print(f"\n[LIMITE] Se alcanzó el límite de {limite} ítem(s) procesados. Finalizando.")
+                    break
+                continue
+
+            # CASO B NORMAL (CON AUTORES EN EL PDF)
+            # 1. Canonicalizar autores propuestos contra Filiaciones y RDU
+            autores_propuestos_crudos = analisis.get("autores_corregidos")
+            if autores_propuestos_crudos is None:
+                autores_propuestos_crudos = autores_rdu
+            autores_canonicos = [
+                canonicalizar_autor(a, autores_rdu, dicc_filiaciones)
+                for a in autores_propuestos_crudos if a
+            ]
+
+            # 2. Evaluar cambios de autores
+            if son_autores_equivalentes(autores_rdu, autores_canonicos):
+                autores_nuevos = list(autores_rdu)
+                cambio_autores = False
+            else:
+                autores_nuevos = autores_canonicos
+                cambio_autores = (autores_nuevos != autores_rdu)
+
+            # 3. Verificar autores sin filiación en la pestaña Filiaciones para Columna D y E
             autores_sin_fil = [a for a in autores_nuevos if not autor_tiene_filiacion(a, dicc_filiaciones)]
             texto_col_d = f"Falta filiación: {'; '.join(autores_sin_fil)}" if autores_sin_fil else ""
             reportar_col_d(texto_col_d)
