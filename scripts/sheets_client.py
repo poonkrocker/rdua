@@ -368,6 +368,30 @@ def marcar_filiaciones_faltantes_cola(ws, row_index: int, texto_faltantes: str, 
     )
 
 
+def marcar_busqueda_filiaciones_cola(ws, row_index: int, texto_busqueda: str, col_e: int = 5):
+    """Actualiza la columna E (Buscar filiaciones con título consolidado) de la hoja Cola.
+    Formato: *título*+buscar filiaciones de: nombre 1; nombre 2
+    Si la fila 1 en esa columna no tiene encabezado, le coloca 'Buscar_Filiaciones'.
+    """
+    col = _indice_columna(ws, "Buscar_Filiaciones", col_e)
+    try:
+        val_h = ws.cell(1, col).value
+        if not val_h:
+            ws.update_cell(1, col, "Buscar_Filiaciones")
+            cache_key = (ws.title, _clave_encabezado("Buscar_Filiaciones"))
+            _cache["col_estado"][cache_key] = col
+    except Exception:
+        pass
+
+    _con_reintentos(
+        f"marcar busqueda filiaciones fila {row_index}",
+        ws.update_cell,
+        row_index,
+        col,
+        texto_busqueda,
+    )
+
+
 def obtener_pendientes_filiaciones(max_items: int | None = None):
     """Igual que obtener_pendientes() pero para la cola ColaFiliaciones."""
     ws = _hoja(HOJA_COLA_FILIACIONES, crear_con=["Link", "Estado"])

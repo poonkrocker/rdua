@@ -1143,6 +1143,7 @@ def procesar_flujo(
         "Autores_Anteriores",
         "Autores_Nuevos",
         "Autores_Sin_Filiacion",
+        "Buscar_Filiaciones",
         "Modificaciones",
         "Accion",
         "Link_Workflow",
@@ -1234,6 +1235,17 @@ def procesar_flujo(
                     except Exception as ex_d:
                         print(f"  [WARN] No se pudo escribir en Col D de Google Sheets (fila {row_idx}): {ex_d}", file=sys.stderr)
 
+            def reportar_col_e(texto: str):
+                if ws_cola and row_idx and sc_mod:
+                    try:
+                        sc_mod.marcar_busqueda_filiaciones_cola(ws_cola, row_idx, texto)
+                        if texto:
+                            print(f"  [COLA] Fila {row_idx} -> Col E (Buscar filiaciones): {texto}")
+                        else:
+                            print(f"  [COLA] Fila {row_idx} -> Col E: (sin autores pendientes)")
+                    except Exception as ex_e:
+                        print(f"  [WARN] No se pudo escribir en Col E de Google Sheets (fila {row_idx}): {ex_e}", file=sys.stderr)
+
             if origen == "cola":
                 print(f"\n[PROCESANDO COLA #{idx}/{len(trabajos)} (Fila {row_idx})] Link: {link_origen}")
                 try:
@@ -1243,6 +1255,7 @@ def procesar_flujo(
                     print(f"  [ERROR] {err_msg}", file=sys.stderr)
                     reportar_col_c(err_msg)
                     reportar_col_d("")
+                    reportar_col_e("")
                     filas_reporte.append({
                         "Fecha": datetime.now().isoformat(),
                         "Workflowitem_ID": "",
@@ -1252,6 +1265,7 @@ def procesar_flujo(
                         "Autores_Anteriores": "",
                         "Autores_Nuevos": "",
                         "Autores_Sin_Filiacion": "",
+                        "Buscar_Filiaciones": "",
                         "Modificaciones": err_msg,
                         "Accion": "ERROR",
                         "Link_Workflow": link_origen,
@@ -1265,6 +1279,7 @@ def procesar_flujo(
                     print(f"  [ERROR] {err_msg}", file=sys.stderr)
                     reportar_col_c(err_msg)
                     reportar_col_d("")
+                    reportar_col_e("")
                     filas_reporte.append({
                         "Fecha": datetime.now().isoformat(),
                         "Workflowitem_ID": "",
@@ -1274,6 +1289,7 @@ def procesar_flujo(
                         "Autores_Anteriores": "",
                         "Autores_Nuevos": "",
                         "Autores_Sin_Filiacion": "",
+                        "Buscar_Filiaciones": "",
                         "Modificaciones": err_msg,
                         "Accion": "ERROR",
                         "Link_Workflow": link_origen,
@@ -1292,6 +1308,7 @@ def procesar_flujo(
                 if row_idx:
                     reportar_col_c("ERROR: Sin workflowitem_id")
                     reportar_col_d("")
+                    reportar_col_e("")
                 continue
 
             # Traer SIEMPRE o enriquecer con los metadatos vivos y completos de RDU (sections, uuid, etc.)
@@ -1317,6 +1334,7 @@ def procesar_flujo(
                 print(f"  [OMITIDO] No se pudo extraer texto del PDF: {det_pdf}")
                 reportar_col_c(f"OMITIDO: {det_pdf}")
                 reportar_col_d("")
+                reportar_col_e("")
                 filas_reporte.append({
                     "Fecha": datetime.now().isoformat(),
                     "Workflowitem_ID": wf_id,
@@ -1326,6 +1344,7 @@ def procesar_flujo(
                     "Autores_Anteriores": "; ".join(autores_rdu),
                     "Autores_Nuevos": "; ".join(autores_rdu),
                     "Autores_Sin_Filiacion": "",
+                    "Buscar_Filiaciones": "",
                     "Modificaciones": det_pdf,
                     "Accion": f"OMITIDO: {det_pdf}",
                     "Link_Workflow": item.get("link_workflow") or link_origen,
@@ -1344,10 +1363,12 @@ def procesar_flujo(
                 print(f"  [ALERTA] ADJUNTO NO CORRESPONDE: {motivo}")
                 print(f"  -> NO se modifican autores ni título. Se marcará [ADJUNTO NO CORRESPONDE] en el resumen.")
 
-                # Verificar autores actuales de RDU contra Filiaciones para Columna D
+                # Verificar autores actuales de RDU contra Filiaciones para Columna D y E
                 autores_sin_fil = [a for a in autores_rdu if not autor_tiene_filiacion(a, dicc_filiaciones)]
                 texto_col_d = f"Falta filiación: {'; '.join(autores_sin_fil)}" if autores_sin_fil else ""
                 reportar_col_d(texto_col_d)
+                texto_col_e = f"*{titulo_rdu}*+buscar filiaciones de: {'; '.join(autores_sin_fil)}" if autores_sin_fil else ""
+                reportar_col_e(texto_col_e)
 
                 if dry_run:
                     print("  [SIMULACIÓN] Se agregaría '[ADJUNTO NO CORRESPONDE]' al inicio del Resumen sin modificar autores/título.")
@@ -1361,6 +1382,7 @@ def procesar_flujo(
                         "Autores_Anteriores": "; ".join(autores_rdu),
                         "Autores_Nuevos": "; ".join(autores_rdu),
                         "Autores_Sin_Filiacion": texto_col_d,
+                        "Buscar_Filiaciones": texto_col_e,
                         "Modificaciones": motivo,
                         "Accion": "SIMULADO_ADJUNTO_NO_CORRESPONDE",
                         "Link_Workflow": item.get("link_workflow") or link_origen,
@@ -1398,6 +1420,7 @@ def procesar_flujo(
                             "Autores_Anteriores": "; ".join(autores_rdu),
                             "Autores_Nuevos": "; ".join(autores_rdu),
                             "Autores_Sin_Filiacion": texto_col_d,
+                            "Buscar_Filiaciones": texto_col_e,
                             "Modificaciones": motivo,
                             "Accion": "MARCADO_ADJUNTO_NO_CORRESPONDE",
                             "Link_Workflow": item.get("link_workflow") or link_origen,
@@ -1417,6 +1440,7 @@ def procesar_flujo(
                             "Autores_Anteriores": "; ".join(autores_rdu),
                             "Autores_Nuevos": "; ".join(autores_rdu),
                             "Autores_Sin_Filiacion": texto_col_d,
+                            "Buscar_Filiaciones": texto_col_e,
                             "Modificaciones": f"ERROR: {e}",
                             "Accion": "ERROR",
                             "Link_Workflow": item.get("link_workflow") or link_origen,
@@ -1467,10 +1491,12 @@ def procesar_flujo(
                 titulo_nuevo = titulo_propuesto_std
                 cambio_titulo = True
 
-            # 4. Verificar autores sin filiación en la pestaña Filiaciones para Columna D
+            # 4. Verificar autores sin filiación en la pestaña Filiaciones para Columna D y E
             autores_sin_fil = [a for a in autores_nuevos if not autor_tiene_filiacion(a, dicc_filiaciones)]
             texto_col_d = f"Falta filiación: {'; '.join(autores_sin_fil)}" if autores_sin_fil else ""
             reportar_col_d(texto_col_d)
+            texto_col_e = f"*{titulo_nuevo}*+buscar filiaciones de: {'; '.join(autores_sin_fil)}" if autores_sin_fil else ""
+            reportar_col_e(texto_col_e)
 
             # 5. Determinar si realmente existen cambios efectivos
             hay_cambios = cambio_titulo or cambio_autores
@@ -1486,6 +1512,7 @@ def procesar_flujo(
                     "Autores_Anteriores": "; ".join(autores_rdu),
                     "Autores_Nuevos": "; ".join(autores_rdu),
                     "Autores_Sin_Filiacion": texto_col_d,
+                    "Buscar_Filiaciones": texto_col_e,
                     "Modificaciones": "Sin cambios requeridos (metadatos coincidentes)",
                     "Accion": "SIN_CAMBIOS",
                     "Link_Workflow": item.get("link_workflow") or link_origen,
@@ -1528,6 +1555,7 @@ def procesar_flujo(
                     "Autores_Anteriores": "; ".join(autores_rdu),
                     "Autores_Nuevos": "; ".join(autores_nuevos),
                     "Autores_Sin_Filiacion": texto_col_d,
+                    "Buscar_Filiaciones": texto_col_e,
                     "Modificaciones": modificaciones,
                     "Accion": "SIMULADO_CORREGIDO",
                     "Link_Workflow": item.get("link_workflow") or link_origen,
@@ -1574,6 +1602,7 @@ def procesar_flujo(
                         "Autores_Anteriores": "; ".join(autores_rdu),
                         "Autores_Nuevos": a_fin,
                         "Autores_Sin_Filiacion": texto_col_d,
+                        "Buscar_Filiaciones": texto_col_e,
                         "Modificaciones": modificaciones,
                         "Accion": "MODIFICADO_Y_DEVUELTO_AL_POOL",
                         "Link_Workflow": item.get("link_workflow") or link_origen,
@@ -1594,6 +1623,7 @@ def procesar_flujo(
                         "Autores_Anteriores": "; ".join(autores_rdu),
                         "Autores_Nuevos": "; ".join(autores_nuevos),
                         "Autores_Sin_Filiacion": texto_col_d,
+                        "Buscar_Filiaciones": texto_col_e,
                         "Modificaciones": f"ERROR: {e}",
                         "Accion": "ERROR",
                         "Link_Workflow": item.get("link_workflow") or link_origen,
