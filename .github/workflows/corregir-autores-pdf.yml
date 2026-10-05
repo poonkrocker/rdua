@@ -67,6 +67,7 @@ jobs:
           RDU_PASSWORD: ${{ secrets.RDU_PASS }}
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          ILOVEPDF_PUBLIC_KEY: ${{ secrets.ILOVEPDF_PUBLIC_KEY }}
         run: python scripts/corregir_autores_desde_pdf.py
 
       - name: Subir reporte CSV

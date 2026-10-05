@@ -5,3 +5,4 @@ gspread==6.1.4
 google-auth==2.36.0
 pypdf==5.1.0
 httpx==0.28.1
+requests>=2.31.0

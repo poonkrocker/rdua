@@ -19,11 +19,12 @@ BASE = "https://api.ilovepdf.com/v1"
 
 
 def _auth() -> str | None:
-    if not PUBLIC_KEY:
+    pub_key = os.environ.get("ILOVEPDF_PUBLIC_KEY") or PUBLIC_KEY
+    if not pub_key:
         print("  [WARN] No hay ILOVEPDF_PUBLIC_KEY configurada; no se puede convertir.")
         return None
     try:
-        r = requests.post(f"{BASE}/auth", json={"public_key": PUBLIC_KEY}, timeout=30)
+        r = requests.post(f"{BASE}/auth", json={"public_key": pub_key}, timeout=30)
         r.raise_for_status()
         return r.json()["token"]
     except Exception as e:

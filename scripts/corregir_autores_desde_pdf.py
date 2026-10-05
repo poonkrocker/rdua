@@ -86,6 +86,17 @@ except ImportError:
     except ImportError:
         sc = None
 
+# Importar cliente de iLovePDF para conversión de doc/docx a PDF
+try:
+    from ilovepdf_client import convertir_a_pdf
+except ImportError:
+    try:
+        from scripts.ilovepdf_client import convertir_a_pdf
+    except ImportError:
+        convertir_a_pdf = None
+
+ELIMINAR_DOCX_ORIGINAL = os.environ.get("ELIMINAR_DOCX_ORIGINAL", "false").lower() in ("true", "1", "yes")
+
 BASE_URL = os.environ.get("RDU_BASE_URL", "https://rdu.unc.edu.ar").rstrip("/")
 API = f"{BASE_URL}/server/api"
 
@@ -546,6 +557,7 @@ def obtener_archivos_workflowitem(client: httpx.Client, wf_id: str, item_uuid: s
                 bundles = item_data.get("_embedded", {}).get("bundles", {}).get("_embedded", {}).get("bundles", [])
                 for b in bundles:
                     if b.get("name") == "ORIGINAL":
+                        bundle_id = b.get("id") or b.get("uuid") or ""
                         bitstreams = (b.get("_embedded", {}).get("bitstreams", {})
                                        .get("_embedded", {}).get("bitstreams", []))
                         for bit in bitstreams:
@@ -558,6 +570,7 @@ def obtener_archivos_workflowitem(client: httpx.Client, wf_id: str, item_uuid: s
                                 "sizeBytes": bit.get("sizeBytes", 0),
                                 "url": url_d,
                                 "uuid": fid,
+                                "bundle_uuid": bundle_id,
                                 "origen": "bundle_ORIGINAL",
                             })
         except Exception as e:
@@ -571,7 +584,8 @@ def obtener_archivos_workflowitem(client: httpx.Client, wf_id: str, item_uuid: s
                 bundles = r.json().get("_embedded", {}).get("bundles", [])
                 for b in bundles:
                     if b.get("name") == "ORIGINAL":
-                        r_bits = client.get(f"{API}/core/bundles/{b.get('id')}/bitstreams")
+                        bundle_id = b.get("id") or b.get("uuid") or ""
+                        r_bits = client.get(f"{API}/core/bundles/{bundle_id}/bitstreams")
                         if r_bits.status_code == 200:
                             bits = r_bits.json().get("_embedded", {}).get("bitstreams", [])
                             for bit in bits:
@@ -582,6 +596,7 @@ def obtener_archivos_workflowitem(client: httpx.Client, wf_id: str, item_uuid: s
                                     "sizeBytes": bit.get("sizeBytes", 0),
                                     "url": url_d,
                                     "uuid": fid,
+                                    "bundle_uuid": bundle_id,
                                     "origen": "bundles_endpoint",
                                 })
         except Exception as e:
@@ -590,11 +605,109 @@ def obtener_archivos_workflowitem(client: httpx.Client, wf_id: str, item_uuid: s
     return archivos
 
 
-def descargar_y_extraer_texto_pdf(client: httpx.Client, wf_id: str, item_uuid: str) -> tuple[str, str]:
-    """Descarga el PDF y extrae texto de las primeras páginas."""
+def obtener_bundle_original_uuid(client: httpx.Client, item_uuid: str) -> str:
+    """Retorna el UUID del bundle ORIGINAL asociado a un ítem en DSpace 7."""
+    if not item_uuid:
+        return ""
+    try:
+        r = client.get(f"{API}/core/items/{item_uuid}?embed=bundles")
+        if r.status_code == 200:
+            bundles = (
+                r.json().get("_embedded", {})
+                .get("bundles", {})
+                .get("_embedded", {})
+                .get("bundles", [])
+            )
+            for b in bundles:
+                if b.get("name") == "ORIGINAL":
+                    bid = b.get("id") or b.get("uuid") or ""
+                    if bid:
+                        return bid
+        r2 = client.get(f"{API}/core/items/{item_uuid}/bundles")
+        if r2.status_code == 200:
+            bundles = r2.json().get("_embedded", {}).get("bundles", [])
+            for b in bundles:
+                if b.get("name") == "ORIGINAL":
+                    bid = b.get("id") or b.get("uuid") or ""
+                    if bid:
+                        return bid
+    except Exception as e:
+        print(f"  [DEBUG] Error buscando bundle ORIGINAL de {item_uuid}: {e}", file=sys.stderr)
+    return ""
+
+
+def subir_bitstream_a_bundle(
+    client: httpx.Client,
+    bundle_uuid: str,
+    nombre_archivo: str,
+    contenido: bytes,
+) -> str | None:
+    """Sube un archivo como bitstream al bundle especificado en DSpace 7.
+    Retorna el UUID del bitstream creado o None si falló."""
+    if not bundle_uuid or not contenido:
+        return None
+    url = f"{API}/core/bundles/{bundle_uuid}/bitstreams"
+    headers = _headers_con_csrf(client)
+    files = {
+        "file": (nombre_archivo, contenido, "application/pdf")
+    }
+    data = {
+        "properties": json.dumps({"name": nombre_archivo})
+    }
+    try:
+        r = client.post(url, files=files, data=data, headers=headers, timeout=120.0)
+        if r.status_code in (200, 201):
+            res_json = r.json()
+            nuevo_uuid = res_json.get("id") or res_json.get("uuid") or ""
+            print(f"  [OK] Bitstream '{nombre_archivo}' subido exitosamente a RDU (UUID: {nuevo_uuid}, Bundle: {bundle_uuid}).", file=sys.stderr)
+            return nuevo_uuid
+        else:
+            print(f"  [ERROR] Falló subida de bitstream a bundle {bundle_uuid}: HTTP {r.status_code} - {r.text[:300]}", file=sys.stderr)
+            return None
+    except Exception as e:
+        print(f"  [ERROR] Excepción al subir bitstream a bundle: {e}", file=sys.stderr)
+        return None
+
+
+def eliminar_bitstream(client: httpx.Client, bitstream_uuid: str) -> bool:
+    """Elimina un bitstream por su UUID en DSpace 7."""
+    if not bitstream_uuid:
+        return False
+    url = f"{API}/core/bitstreams/{bitstream_uuid}"
+    headers = _headers_con_csrf(client)
+    try:
+        r = client.delete(url, headers=headers, timeout=30.0)
+        if r.status_code in (200, 204):
+            print(f"  [OK] Bitstream anterior {bitstream_uuid} eliminado de RDU.", file=sys.stderr)
+            return True
+        else:
+            print(f"  [WARN] No se pudo eliminar bitstream {bitstream_uuid}: HTTP {r.status_code}", file=sys.stderr)
+            return False
+    except Exception as e:
+        print(f"  [WARN] Error eliminando bitstream {bitstream_uuid}: {e}", file=sys.stderr)
+        return False
+
+
+def descargar_y_extraer_texto_pdf(
+    client: httpx.Client,
+    wf_id: str,
+    item_uuid: str,
+    dry_run: bool = False,
+) -> tuple[str, str, dict]:
+    """Descarga el PDF (o convierte Word doc/docx a PDF si es necesario)
+    y extrae texto de las primeras páginas.
+    Retorna (texto_extraido, detalle_o_error, info_adjunto).
+    """
+    info_vacia = {
+        "convertido_de_docx": False,
+        "nombre_original": "",
+        "nombre_pdf": "",
+        "subido_a_rdu": False,
+        "bitstream_uuid": None,
+    }
     archivos = obtener_archivos_workflowitem(client, wf_id, item_uuid)
     if not archivos:
-        return "", "SIN ARCHIVOS ADJUNTOS ENCONTRADOS (ni en secciones de upload ni en bundles)"
+        return "", "SIN ARCHIVOS ADJUNTOS ENCONTRADOS (ni en secciones de upload ni en bundles)", info_vacia
 
     nombres_archivos = [f"{a.get('nombre')} ({a.get('sizeBytes')}B, {a.get('origen')})" for a in archivos]
     print(f"  [ARCHIVOS] Detectados {len(archivos)} archivo(s): {', '.join(nombres_archivos)}", file=sys.stderr)
@@ -605,27 +718,94 @@ def descargar_y_extraer_texto_pdf(client: httpx.Client, wf_id: str, item_uuid: s
         if nombre.endswith(".pdf"):
             candidato_pdf = a
             break
-    if not candidato_pdf:
-        candidato_pdf = max(archivos, key=lambda x: x.get("sizeBytes", 0))
 
-    content_url = candidato_pdf.get("url")
-    if not content_url and candidato_pdf.get("uuid"):
-        content_url = f"{API}/core/bitstreams/{candidato_pdf['uuid']}/content"
+    candidato_word = None
+    if not candidato_pdf:
+        for a in archivos:
+            nombre = (a.get("nombre") or "").lower()
+            if nombre.endswith((".docx", ".doc")):
+                candidato_word = a
+                break
+
+    candidato = candidato_pdf or candidato_word
+    if not candidato:
+        candidato = max(archivos, key=lambda x: x.get("sizeBytes", 0))
+
+    content_url = candidato.get("url")
+    if not content_url and candidato.get("uuid"):
+        content_url = f"{API}/core/bitstreams/{candidato['uuid']}/content"
 
     if not content_url:
-        return "", f"SIN LINK DE DESCARGA PARA '{candidato_pdf.get('nombre')}'"
+        return "", f"SIN LINK DE DESCARGA PARA '{candidato.get('nombre')}'", info_vacia
 
-    print(f"  [DESCARGA] Descargando '{candidato_pdf.get('nombre')}' ({candidato_pdf.get('sizeBytes')} B)...", file=sys.stderr)
+    nombre_candidato = candidato.get("nombre") or "archivo_adjunto"
+    print(f"  [DESCARGA] Descargando '{nombre_candidato}' ({candidato.get('sizeBytes')} B)...", file=sys.stderr)
     try:
         resp = client.get(content_url)
         if resp.status_code != 200:
-            return "", f"HTTP {resp.status_code} AL DESCARGAR '{candidato_pdf.get('nombre')}'"
-        pdf_bytes = resp.content
+            return "", f"HTTP {resp.status_code} AL DESCARGAR '{nombre_candidato}'", info_vacia
+        archivo_bytes = resp.content
     except Exception as e:
-        return "", f"ERROR AL DESCARGAR ARCHIVO: {e}"
+        return "", f"ERROR AL DESCARGAR ARCHIVO: {e}", info_vacia
 
-    if len(pdf_bytes) < 100:
-        return "", f"ARCHIVO DEMASIADO PEQUEÑO ({len(pdf_bytes)} B)"
+    if len(archivo_bytes) < 100:
+        return "", f"ARCHIVO DEMASIADO PEQUEÑO ({len(archivo_bytes)} B)", info_vacia
+
+    # Detección de Word (.docx / .doc) por extensión o magic bytes
+    nombre_lower = nombre_candidato.lower()
+    es_docx = False
+    if nombre_lower.endswith((".docx", ".doc")):
+        es_docx = True
+    elif not archivo_bytes.startswith(b"%PDF-") and (
+        archivo_bytes.startswith(b"PK\x03\x04") or archivo_bytes.startswith(b"\xd0\xcf\x11\xe0")
+    ):
+        es_docx = True
+
+    pdf_bytes = archivo_bytes
+    info_adjunto = {
+        "convertido_de_docx": False,
+        "nombre_original": nombre_candidato,
+        "nombre_pdf": nombre_candidato,
+        "subido_a_rdu": False,
+        "bitstream_uuid": None,
+    }
+
+    if es_docx:
+        print(f"  [CONVERSIÓN] Se detectó adjunto Word ('{nombre_candidato}'). Convirtiendo a PDF mediante iLovePDF API...", file=sys.stderr)
+        if not convertir_a_pdf:
+            return "", f"ADJUNTO ES WORD ('{nombre_candidato}') PERO NO ESTÁ DISPONIBLE EL MÓDULO ILOVEPDF", info_vacia
+
+        pdf_convertido = convertir_a_pdf(nombre_candidato, archivo_bytes)
+        if not pdf_convertido:
+            return "", f"ERROR AL CONVERTIR WORD ('{nombre_candidato}') A PDF CON ILOVEPDF", info_vacia
+
+        pdf_bytes = pdf_convertido
+        base_sin_ext = re.sub(r"\.(docx?|doc)$", "", nombre_candidato, flags=re.I)
+        nombre_pdf = f"{base_sin_ext}.pdf" if base_sin_ext else f"{nombre_candidato}.pdf"
+
+        bitstream_subido = False
+        nuevo_uuid = None
+        if not dry_run:
+            bundle_uuid = candidato.get("bundle_uuid") or obtener_bundle_original_uuid(client, item_uuid)
+            if bundle_uuid:
+                print(f"  [SUBIDA] Subiendo nuevo PDF '{nombre_pdf}' al bundle ORIGINAL ({bundle_uuid}) en RDU...", file=sys.stderr)
+                nuevo_uuid = subir_bitstream_a_bundle(client, bundle_uuid, nombre_pdf, pdf_bytes)
+                if nuevo_uuid:
+                    bitstream_subido = True
+                    if ELIMINAR_DOCX_ORIGINAL and candidato.get("uuid"):
+                        eliminar_bitstream(client, candidato["uuid"])
+            else:
+                print(f"  [WARN] No se localizó el bundle ORIGINAL de {item_uuid} para subir el PDF.", file=sys.stderr)
+        else:
+            print(f"  [SIMULACIÓN] Se subiría el PDF convertido '{nombre_pdf}' ({len(pdf_bytes)} B) al bundle ORIGINAL de RDU.", file=sys.stderr)
+
+        info_adjunto = {
+            "convertido_de_docx": True,
+            "nombre_original": nombre_candidato,
+            "nombre_pdf": nombre_pdf,
+            "subido_a_rdu": bitstream_subido,
+            "bitstream_uuid": nuevo_uuid,
+        }
 
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -637,10 +817,12 @@ def descargar_y_extraer_texto_pdf(client: httpx.Client, wf_id: str, item_uuid: s
         texto = texto.strip()
         print(f"  [TEXTO] Extraídos {len(texto)} caracteres de {min(4, num_paginas)} página(s).", file=sys.stderr)
         if not texto:
-            return "", f"PDF IMAGEN ESCANEADA / SIN TEXTO EXTRAIBLE ({num_paginas} págs)"
-        return texto, f"OK ({len(texto)} chars de {min(4, num_paginas)} págs)"
+            return "", f"PDF IMAGEN ESCANEADA / SIN TEXTO EXTRAIBLE ({num_paginas} págs)", info_adjunto
+
+        prefijo_det = f"OK [DOCX CONVERTIDO A PDF: {info_adjunto['nombre_pdf']}]" if info_adjunto.get("convertido_de_docx") else "OK"
+        return texto, f"{prefijo_det} ({len(texto)} chars de {min(4, num_paginas)} págs)", info_adjunto
     except Exception as e:
-        return "", f"ERROR AL PARSEAR PDF: {e}"
+        return "", f"ERROR AL PARSEAR PDF: {e}", info_adjunto
 
 
 def es_token_inicial_secundaria(token: str) -> bool:
@@ -1352,8 +1534,8 @@ def procesar_flujo(
             print(f"  Autores RDU: {autores_rdu}")
             print(f"  UUID: {uuid or '(no encontrado)'} | Workflowitem: {wf_id}")
 
-            # Descargar PDF y extraer texto (busca en upload sections y en bundles)
-            texto_pdf, det_pdf = descargar_y_extraer_texto_pdf(client, wf_id, uuid)
+            # Descargar PDF y extraer texto (busca en upload sections y en bundles, convierte docx si aplica)
+            texto_pdf, det_pdf, info_adjunto = descargar_y_extraer_texto_pdf(client, wf_id, uuid, dry_run=dry_run)
             if not texto_pdf:
                 print(f"  [OMITIDO] No se pudo extraer texto del PDF: {det_pdf}")
                 reportar_col_c(f"OMITIDO: {det_pdf}")
@@ -1384,6 +1566,8 @@ def procesar_flujo(
             # CASO A: EL PDF ADJUNTO NO CORRESPONDE AL ARTÍCULO
             if analisis.get("adjunto_corresponde") is False:
                 motivo = analisis.get("motivo_no_corresponde") or "El PDF adjunto pertenece a otro artículo completamente diferente"
+                if info_adjunto.get("convertido_de_docx"):
+                    motivo = f"{motivo} (adjunto Word '{info_adjunto['nombre_original']}' convertido a PDF)"
                 print(f"  [ALERTA] ADJUNTO NO CORRESPONDE: {motivo}")
                 print(f"  -> NO se modifican autores ni título. Se marcará [ADJUNTO NO CORRESPONDE] en el resumen.")
 
@@ -1517,14 +1701,21 @@ def procesar_flujo(
                 reportar_col_d(texto_col_d)
                 reportar_col_e("")  # No se buscan filiaciones externas de autores no presentes en el PDF
 
+                nota_adj = ""
+                if info_adjunto.get("convertido_de_docx"):
+                    if dry_run:
+                        nota_adj = f"; adjunto Word '{info_adjunto['nombre_original']}' convertido a PDF (simulado)"
+                    else:
+                        nota_adj = f"; adjunto Word '{info_adjunto['nombre_original']}' convertido y subido como '{info_adjunto['nombre_pdf']}'"
+
                 if cambio_titulo:
                     if son_titulos_equivalentes(titulo_rdu, titulo_nuevo):
                         desc_tit = "se estandarizó el formato del título (minúsculas y ' : ')"
                     else:
                         desc_tit = "se corrigió el título según PDF"
-                    modificaciones = f"[PDF SIN AUTOR] Modificaciones: {desc_tit}; {motivo_sin_autor}{det_rdu}"
+                    modificaciones = f"[PDF SIN AUTOR] Modificaciones: {desc_tit}; {motivo_sin_autor}{det_rdu}{nota_adj}"
                 else:
-                    modificaciones = f"[PDF SIN AUTOR] {motivo_sin_autor}{det_rdu}; metadatos de título coincidentes"
+                    modificaciones = f"[PDF SIN AUTOR] {motivo_sin_autor}{det_rdu}; metadatos de título coincidentes{nota_adj}"
 
                 print(f"  [ALERTA PDF SIN AUTOR]: {modificaciones}")
                 if cambio_titulo:
@@ -1650,7 +1841,14 @@ def procesar_flujo(
             reportar_col_e(texto_col_e)
 
             # 5. Determinar si realmente existen cambios efectivos
-            hay_cambios = cambio_titulo or cambio_autores
+            nota_adjunto = ""
+            if info_adjunto.get("convertido_de_docx"):
+                if dry_run:
+                    nota_adjunto = f"adjunto Word '{info_adjunto['nombre_original']}' convertido a PDF (simulado)"
+                else:
+                    nota_adjunto = f"adjunto Word '{info_adjunto['nombre_original']}' convertido y subido como '{info_adjunto['nombre_pdf']}'"
+
+            hay_cambios = cambio_titulo or cambio_autores or info_adjunto.get("subido_a_rdu") or (dry_run and info_adjunto.get("convertido_de_docx"))
             if not hay_cambios:
                 print("  [OK] Metadatos coincidentes (formato institucional RDU y filiaciones validadas), NO se requieren modificaciones.")
                 if not dry_run:
@@ -1695,12 +1893,17 @@ def procesar_flujo(
             elif cambio_autores and not cambio_titulo:
                 desc_autores = describir_cambios_autores(autores_rdu, autores_nuevos)
                 modificaciones = f"Modificaciones: {desc_autores}"
-            else:
+            elif cambio_titulo and cambio_autores:
                 desc_autores = describir_cambios_autores(autores_rdu, autores_nuevos)
                 if son_titulos_equivalentes(titulo_rdu, titulo_nuevo):
                     modificaciones = f"Modificaciones: {desc_autores}; se estandarizó el formato del título (minúsculas y ' : ')"
                 else:
                     modificaciones = f"Modificaciones: se corrigió el título según PDF; {desc_autores}"
+            else:
+                modificaciones = f"Modificaciones: {nota_adjunto}"
+
+            if nota_adjunto and (cambio_titulo or cambio_autores):
+                modificaciones = f"{modificaciones}; {nota_adjunto}"
 
             print(f"  [CAMBIOS DETECTADOS]: {modificaciones}")
             if cambio_titulo:
