@@ -565,8 +565,10 @@ def obtener_archivos_workflowitem(client: httpx.Client, wf_id: str, item_uuid: s
         except Exception as e:
             print(f"  [DEBUG] Error leyendo secciones de workflowitem {wf_id}: {e}", file=sys.stderr)
 
-    # 2. Si no encontró en sections, buscar en bundles del item
-    if not archivos and item_uuid:
+    vistos = {a.get("uuid") for a in archivos if a.get("uuid")}
+
+    # 2. Buscar también en bundles ORIGINAL del item (pueden existir archivos ya depositados en el bundle)
+    if item_uuid:
         try:
             r = client.get(f"{API}/core/items/{item_uuid}?embed=bundles/bitstreams")
             if r.status_code == 200:
@@ -582,6 +584,10 @@ def obtener_archivos_workflowitem(client: httpx.Client, wf_id: str, item_uuid: s
                             url_d = bit.get("_links", {}).get("content", {}).get("href")
                             if not url_d and fid:
                                 url_d = f"{API}/core/bitstreams/{fid}/content"
+                            if fid and fid in vistos:
+                                continue
+                            if fid:
+                                vistos.add(fid)
                             archivos.append({
                                 "nombre": bit.get("name", ""),
                                 "sizeBytes": bit.get("sizeBytes", 0),
@@ -593,7 +599,7 @@ def obtener_archivos_workflowitem(client: httpx.Client, wf_id: str, item_uuid: s
         except Exception as e:
             print(f"  [DEBUG] Error leyendo bundles de {item_uuid}: {e}", file=sys.stderr)
 
-    # 3. Endpoint alternativo directo /core/items/{uuid}/bundles
+    # 3. Endpoint alternativo directo /core/items/{uuid}/bundles si aún no hay archivos
     if not archivos and item_uuid:
         try:
             r = client.get(f"{API}/core/items/{item_uuid}/bundles")
@@ -608,6 +614,10 @@ def obtener_archivos_workflowitem(client: httpx.Client, wf_id: str, item_uuid: s
                             for bit in bits:
                                 fid = bit.get("id") or ""
                                 url_d = bit.get("_links", {}).get("content", {}).get("href") or f"{API}/core/bitstreams/{fid}/content"
+                                if fid and fid in vistos:
+                                    continue
+                                if fid:
+                                    vistos.add(fid)
                                 archivos.append({
                                     "nombre": bit.get("name", ""),
                                     "sizeBytes": bit.get("sizeBytes", 0),
@@ -748,6 +758,12 @@ def recortar_pdf_capitulo(
     writer = PdfWriter()
     total = len(reader.pages)
 
+    if pag_inicio <= len(paginas_caratula) or pag_inicio <= 2:
+        raise ValueError(f"Página de inicio ({pag_inicio}) no puede ser anterior o igual a las páginas de carátula")
+
+    if pag_fin < pag_inicio:
+        raise ValueError(f"Página de fin ({pag_fin}) no puede ser menor a la de inicio ({pag_inicio})")
+
     seleccionadas = []
     for p in paginas_caratula:
         if 1 <= p <= total and p not in seleccionadas:
@@ -755,6 +771,9 @@ def recortar_pdf_capitulo(
     for p in range(pag_inicio, pag_fin + 1):
         if 1 <= p <= total and p not in seleccionadas:
             seleccionadas.append(p)
+
+    if len(seleccionadas) <= len(paginas_caratula):
+        raise ValueError("El recorte no contiene páginas del capítulo")
 
     for p in seleccionadas:
         writer.add_page(reader.pages[p - 1])
@@ -989,6 +1008,14 @@ def localizar_capitulo_con_indice_deepseek(
         if not isinstance(p_ini_imp, int) or not isinstance(p_fin_imp, int):
             return None
 
+        # Guardrails: un capítulo interno nunca empieza en carátula/índice (páginas 1 o 2)
+        if p_ini_imp <= 2 or p_fin_imp < p_ini_imp:
+            print(f"  [DEEPSEEK ÍNDICE] Rango propuesto ({p_ini_imp}-{p_fin_imp}) no es un capítulo interno recortable (inicia en preliminares).", file=sys.stderr)
+            return None
+
+        if (p_fin_imp - p_ini_imp + 1) < 2:
+            return None
+
         print(
             f"  [DEEPSEEK ÍNDICE] Encontrado en índice: '{res_dict.get('titulo_en_indice')}' "
             f"| Rango impreso: págs. {p_ini_imp}-{p_fin_imp} | Sig: '{res_dict.get('siguiente_item_titulo')}' "
@@ -1025,7 +1052,16 @@ def localizar_capitulo_con_indice_deepseek(
                 offset = 0
 
         pag_inicio_fisica = mejor_pag_fisica
+        if not pag_inicio_fisica or pag_inicio_fisica <= 2:
+            print(f"  [DEEPSEEK ÍNDICE] Página física ({pag_inicio_fisica}) es carátula. No se realiza recorte.", file=sys.stderr)
+            return None
+
         pag_fin_fisica = max(pag_inicio_fisica, min(total_paginas, p_fin_imp + offset))
+        if pag_fin_fisica <= pag_inicio_fisica:
+            return None
+
+        if (pag_fin_fisica - pag_inicio_fisica + 1) < 2 or (pag_fin_fisica - pag_inicio_fisica + 1) >= (total_paginas - 2):
+            return None
 
         p_sig_imp = res_dict.get("siguiente_item_pagina_impresa")
         if isinstance(p_sig_imp, int) and p_sig_imp > p_ini_imp:
@@ -1094,210 +1130,230 @@ def descargar_y_extraer_texto_pdf(
     nombres_archivos = [f"{a.get('nombre')} ({a.get('sizeBytes')}B, {a.get('origen')})" for a in archivos]
     print(f"  [ARCHIVOS] Detectados {len(archivos)} archivo(s): {', '.join(nombres_archivos)}", file=sys.stderr)
 
-    candidato_pdf = None
-    for a in archivos:
-        nombre = (a.get("nombre") or "").lower()
-        if nombre.endswith(".pdf"):
-            candidato_pdf = a
-            break
+    # Ordenar y priorizar candidatos para garantizar que se evalúe el trabajo principal
+    # Se penalizan licencias o autorizaciones administrativas (suelen ser de 1-2 págs escaneadas)
+    keywords_admin = [
+        "licencia", "autorizacion", "autorización", "cesion", "cesión",
+        "declaracion", "declaración", "constancia", "acta", "acuerdo",
+        "permiso", "compromiso"
+    ]
 
-    candidato_word = None
-    if not candidato_pdf:
-        for a in archivos:
-            nombre = (a.get("nombre") or "").lower()
-            if nombre.endswith((".docx", ".doc")):
-                candidato_word = a
-                break
+    def _prioridad_archivo(a: dict) -> tuple:
+        nom = (a.get("nombre") or "").lower()
+        sz = a.get("sizeBytes", 0)
+        es_pdf = nom.endswith(".pdf")
+        es_word = nom.endswith((".docx", ".doc"))
+        es_admin = any(k in nom for k in keywords_admin)
+        # Prioridad: (no es admin, es formato compatible, tamaño en bytes)
+        return (not es_admin, es_pdf or es_word, sz)
 
-    candidato = candidato_pdf or candidato_word
-    if not candidato:
-        candidato = max(archivos, key=lambda x: x.get("sizeBytes", 0))
+    candidatos_ordenados = sorted(archivos, key=_prioridad_archivo, reverse=True)
+    if not candidatos_ordenados:
+        return "", "SIN ARCHIVOS ADJUNTOS ENCONTRADOS", info_vacia
 
-    content_url = candidato.get("url")
-    if not content_url and candidato.get("uuid"):
-        content_url = f"{API}/core/bitstreams/{candidato['uuid']}/content"
+    ultimo_error = ""
+    for candidato in candidatos_ordenados:
+        nombre_candidato = candidato.get("nombre") or "archivo_adjunto"
+        content_url = candidato.get("url")
+        if not content_url and candidato.get("uuid"):
+            content_url = f"{API}/core/bitstreams/{candidato['uuid']}/content"
 
-    if not content_url:
-        return "", f"SIN LINK DE DESCARGA PARA '{candidato.get('nombre')}'", info_vacia
+        if not content_url:
+            ultimo_error = f"SIN LINK DE DESCARGA PARA '{nombre_candidato}'"
+            continue
 
-    nombre_candidato = candidato.get("nombre") or "archivo_adjunto"
-    print(f"  [DESCARGA] Descargando '{nombre_candidato}' ({candidato.get('sizeBytes')} B)...", file=sys.stderr)
-    try:
-        resp = client.get(content_url)
-        if resp.status_code != 200:
-            return "", f"HTTP {resp.status_code} AL DESCARGAR '{nombre_candidato}'", info_vacia
-        archivo_bytes = resp.content
-    except Exception as e:
-        return "", f"ERROR AL DESCARGAR ARCHIVO: {e}", info_vacia
+        print(f"  [DESCARGA] Evaluando '{nombre_candidato}' ({candidato.get('sizeBytes')} B, origen: {candidato.get('origen')})...", file=sys.stderr)
+        try:
+            resp = client.get(content_url)
+            if resp.status_code != 200:
+                ultimo_error = f"HTTP {resp.status_code} AL DESCARGAR '{nombre_candidato}'"
+                continue
+            archivo_bytes = resp.content
+        except Exception as e:
+            ultimo_error = f"ERROR AL DESCARGAR ARCHIVO '{nombre_candidato}': {e}"
+            continue
 
-    if len(archivo_bytes) < 100:
-        return "", f"ARCHIVO DEMASIADO PEQUEÑO ({len(archivo_bytes)} B)", info_vacia
+        if len(archivo_bytes) < 100:
+            ultimo_error = f"ARCHIVO DEMASIADO PEQUEÑO ({len(archivo_bytes)} B)"
+            continue
 
-    # Detección de Word (.docx / .doc) por extensión o magic bytes
-    nombre_lower = nombre_candidato.lower()
-    es_docx = False
-    if nombre_lower.endswith((".docx", ".doc")):
-        es_docx = True
-    elif not archivo_bytes.startswith(b"%PDF-") and (
-        archivo_bytes.startswith(b"PK\x03\x04") or archivo_bytes.startswith(b"\xd0\xcf\x11\xe0")
-    ):
-        es_docx = True
+        # Detección de Word (.docx / .doc) por extensión o magic bytes
+        nombre_lower = nombre_candidato.lower()
+        es_docx = False
+        if nombre_lower.endswith((".docx", ".doc")):
+            es_docx = True
+        elif not archivo_bytes.startswith(b"%PDF-") and (
+            archivo_bytes.startswith(b"PK\x03\x04") or archivo_bytes.startswith(b"\xd0\xcf\x11\xe0")
+        ):
+            es_docx = True
 
-    pdf_bytes = archivo_bytes
-    info_adjunto = {
-        "convertido_de_docx": False,
-        "nombre_original": nombre_candidato,
-        "nombre_pdf": nombre_candidato,
-        "subido_a_rdu": False,
-        "bitstream_uuid": None,
-        "recorte_libro": None,
-    }
-
-    if es_docx:
-        print(f"  [CONVERSIÓN] Se detectó adjunto Word ('{nombre_candidato}'). Convirtiendo a PDF mediante iLovePDF API...", file=sys.stderr)
-        if not convertir_a_pdf:
-            return "", f"ADJUNTO ES WORD ('{nombre_candidato}') PERO NO ESTÁ DISPONIBLE EL MÓDULO ILOVEPDF", info_vacia
-
-        pdf_convertido = convertir_a_pdf(nombre_candidato, archivo_bytes)
-        if not pdf_convertido:
-            return "", f"ERROR AL CONVERTIR WORD ('{nombre_candidato}') A PDF CON ILOVEPDF", info_vacia
-
-        pdf_bytes = pdf_convertido
-        base_sin_ext = re.sub(r"\.(docx?|doc)$", "", nombre_candidato, flags=re.I)
-        nombre_pdf = f"{base_sin_ext}.pdf" if base_sin_ext else f"{nombre_candidato}.pdf"
-
-        bitstream_subido = False
-        nuevo_uuid = None
-        if not dry_run:
-            bundle_uuid = candidato.get("bundle_uuid") or obtener_bundle_original_uuid(client, item_uuid)
-            if bundle_uuid:
-                print(f"  [SUBIDA] Subiendo nuevo PDF '{nombre_pdf}' al bundle ORIGINAL ({bundle_uuid}) en RDU...", file=sys.stderr)
-                nuevo_uuid = subir_bitstream_a_bundle(client, bundle_uuid, nombre_pdf, pdf_bytes)
-                if nuevo_uuid:
-                    bitstream_subido = True
-                    if ELIMINAR_DOCX_ORIGINAL and candidato.get("uuid"):
-                        eliminar_bitstream(client, candidato["uuid"])
-            else:
-                print(f"  [WARN] No se localizó el bundle ORIGINAL de {item_uuid} para subir el PDF.", file=sys.stderr)
-        else:
-            print(f"  [SIMULACIÓN] Se subiría el PDF convertido '{nombre_pdf}' ({len(pdf_bytes)} B) al bundle ORIGINAL de RDU.", file=sys.stderr)
-
+        pdf_bytes = archivo_bytes
         info_adjunto = {
-            "convertido_de_docx": True,
+            "convertido_de_docx": False,
             "nombre_original": nombre_candidato,
-            "nombre_pdf": nombre_pdf,
-            "subido_a_rdu": bitstream_subido,
-            "bitstream_uuid": nuevo_uuid,
+            "nombre_pdf": nombre_candidato,
+            "subido_a_rdu": False,
+            "bitstream_uuid": None,
             "recorte_libro": None,
         }
 
-    try:
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        num_paginas = len(reader.pages)
-        recorte_info = None
+        if es_docx:
+            print(f"  [CONVERSIÓN] Se detectó adjunto Word ('{nombre_candidato}'). Convirtiendo a PDF mediante iLovePDF API...", file=sys.stderr)
+            if not convertir_a_pdf:
+                ultimo_error = f"ADJUNTO ES WORD ('{nombre_candidato}') PERO NO ESTÁ DISPONIBLE EL MÓDULO ILOVEPDF"
+                continue
 
-        # DETECCIÓN Y RECORTE DE PARTE DE LIBRO (BOOKPART) EN PDFS EXTENSOS
-        if num_paginas > 4 and titulo_rdu:
-            loc = None
-            if rango_sugerido and len(rango_sugerido) == 2:
-                p_ini, p_fin = rango_sugerido
-                if 1 <= p_ini <= num_paginas and p_ini <= p_fin <= num_paginas:
-                    paginas_caratula = [1, 2] if p_ini > 2 else [1]
-                    loc = (paginas_caratula, p_ini, p_fin)
+            pdf_convertido = convertir_a_pdf(nombre_candidato, archivo_bytes)
+            if not pdf_convertido:
+                ultimo_error = f"ERROR AL CONVERTIR WORD ('{nombre_candidato}') A PDF CON ILOVEPDF"
+                continue
 
-            if not loc and client_ai:
-                loc = localizar_capitulo_con_indice_deepseek(
-                    client_ai=client_ai,
-                    model=deepseek_model,
-                    reader=reader,
-                    titulo_rdu=titulo_rdu,
-                    autores_rdu=autores_rdu,
-                    total_paginas=num_paginas,
-                )
+            pdf_bytes = pdf_convertido
+            base_sin_ext = re.sub(r"\.(docx?|doc)$", "", nombre_candidato, flags=re.I)
+            nombre_pdf = f"{base_sin_ext}.pdf" if base_sin_ext else f"{nombre_candidato}.pdf"
 
-            if not loc:
-                loc = localizar_capitulo_en_pdf(reader, titulo_rdu, autores_rdu, rango_sugerido)
+            bitstream_subido = False
+            nuevo_uuid = None
+            if not dry_run:
+                bundle_uuid = candidato.get("bundle_uuid") or obtener_bundle_original_uuid(client, item_uuid)
+                if bundle_uuid:
+                    print(f"  [SUBIDA] Subiendo nuevo PDF '{nombre_pdf}' al bundle ORIGINAL ({bundle_uuid}) en RDU...", file=sys.stderr)
+                    nuevo_uuid = subir_bitstream_a_bundle(client, bundle_uuid, nombre_pdf, pdf_bytes)
+                    if nuevo_uuid:
+                        bitstream_subido = True
+                        if ELIMINAR_DOCX_ORIGINAL and candidato.get("uuid"):
+                            eliminar_bitstream(client, candidato["uuid"])
+                else:
+                    print(f"  [WARN] No se localizó el bundle ORIGINAL de {item_uuid} para subir el PDF.", file=sys.stderr)
+            else:
+                print(f"  [SIMULACIÓN] Se subiría el PDF convertido '{nombre_pdf}' ({len(pdf_bytes)} B) al bundle ORIGINAL de RDU.", file=sys.stderr)
 
-            if loc:
-                paginas_caratula, pag_inicio, pag_fin = loc
-                print(
-                    f"  [PARTE DE LIBRO] Detectado capítulo en págs. {pag_inicio}-{pag_fin} "
-                    f"(carátula: págs. {paginas_caratula}) de un total de {num_paginas} págs.",
-                    file=sys.stderr,
-                )
-                try:
-                    pdf_recortado = recortar_pdf_capitulo(pdf_bytes, paginas_caratula, pag_inicio, pag_fin)
-                    base_nom = re.sub(r"\.(pdf|docx?|doc)$", "", info_adjunto["nombre_pdf"], flags=re.I)
-                    nombre_recortado = f"{base_nom}_p{pag_inicio}-{pag_fin}.pdf"
+            info_adjunto = {
+                "convertido_de_docx": True,
+                "nombre_original": nombre_candidato,
+                "nombre_pdf": nombre_pdf,
+                "subido_a_rdu": bitstream_subido,
+                "bitstream_uuid": nuevo_uuid,
+                "recorte_libro": None,
+            }
 
-                    bitstream_recortado_subido = False
-                    nuevo_uuid_recorte = None
-                    if not dry_run:
-                        bundle_uuid = candidato.get("bundle_uuid") or obtener_bundle_original_uuid(client, item_uuid)
-                        if bundle_uuid:
+        try:
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            num_paginas = len(reader.pages)
+            recorte_info = None
+
+            # DETECCIÓN Y RECORTE DE PARTE DE LIBRO (BOOKPART) EN PDFS EXTENSOS
+            if num_paginas > 4 and titulo_rdu:
+                loc = None
+                if rango_sugerido and len(rango_sugerido) == 2:
+                    p_ini, p_fin = rango_sugerido
+                    if 1 <= p_ini <= num_paginas and p_ini <= p_fin <= num_paginas:
+                        paginas_caratula = [1, 2] if p_ini > 2 else [1]
+                        loc = (paginas_caratula, p_ini, p_fin)
+
+                if not loc and client_ai:
+                    loc = localizar_capitulo_con_indice_deepseek(
+                        client_ai=client_ai,
+                        model=deepseek_model,
+                        reader=reader,
+                        titulo_rdu=titulo_rdu,
+                        autores_rdu=autores_rdu,
+                        total_paginas=num_paginas,
+                    )
+
+                if not loc:
+                    loc = localizar_capitulo_en_pdf(reader, titulo_rdu, autores_rdu, rango_sugerido)
+
+                if loc:
+                    paginas_caratula, pag_inicio, pag_fin = loc
+                    print(
+                        f"  [PARTE DE LIBRO] Detectado capítulo en págs. {pag_inicio}-{pag_fin} "
+                        f"(carátula: págs. {paginas_caratula}) de un total de {num_paginas} págs.",
+                        file=sys.stderr,
+                    )
+                    try:
+                        pdf_recortado = recortar_pdf_capitulo(pdf_bytes, paginas_caratula, pag_inicio, pag_fin)
+                        base_nom = re.sub(r"\.(pdf|docx?|doc)$", "", info_adjunto["nombre_pdf"], flags=re.I)
+                        nombre_recortado = f"{base_nom}_p{pag_inicio}-{pag_fin}.pdf"
+
+                        bitstream_recortado_subido = False
+                        nuevo_uuid_recorte = None
+                        if not dry_run:
+                            bundle_uuid = candidato.get("bundle_uuid") or obtener_bundle_original_uuid(client, item_uuid)
+                            if bundle_uuid:
+                                print(
+                                    f"  [SUBIDA] Subiendo PDF recortado '{nombre_recortado}' ({len(pdf_recortado)} B) al bundle ORIGINAL...",
+                                    file=sys.stderr,
+                                )
+                                nuevo_uuid_recorte = subir_bitstream_a_bundle(
+                                    client, bundle_uuid, nombre_recortado, pdf_recortado
+                                )
+                                if nuevo_uuid_recorte:
+                                    bitstream_recortado_subido = True
+                            else:
+                                print(f"  [WARN] No se localizó bundle ORIGINAL para subir PDF recortado.", file=sys.stderr)
+                        else:
                             print(
-                                f"  [SUBIDA] Subiendo PDF recortado '{nombre_recortado}' ({len(pdf_recortado)} B) al bundle ORIGINAL...",
+                                f"  [SIMULACIÓN] Se subiría el PDF recortado '{nombre_recortado}' ({len(pdf_recortado)} B) al bundle ORIGINAL.",
                                 file=sys.stderr,
                             )
-                            nuevo_uuid_recorte = subir_bitstream_a_bundle(
-                                client, bundle_uuid, nombre_recortado, pdf_recortado
-                            )
-                            if nuevo_uuid_recorte:
-                                bitstream_recortado_subido = True
-                        else:
-                            print(f"  [WARN] No se localizó bundle ORIGINAL para subir PDF recortado.", file=sys.stderr)
-                    else:
-                        print(
-                            f"  [SIMULACIÓN] Se subiría el PDF recortado '{nombre_recortado}' ({len(pdf_recortado)} B) al bundle ORIGINAL.",
-                            file=sys.stderr,
-                        )
 
-                    recorte_info = {
-                        "activo": True,
-                        "paginas_caratula": paginas_caratula,
-                        "pag_inicio": pag_inicio,
-                        "pag_fin": pag_fin,
-                        "nombre_recortado": nombre_recortado,
-                        "subido": bitstream_recortado_subido,
-                        "subido_a_rdu": bitstream_recortado_subido,
-                        "uuid": nuevo_uuid_recorte,
-                    }
-                    info_adjunto["recorte_libro"] = recorte_info
-                    info_adjunto["nombre_pdf"] = nombre_recortado
+                        recorte_info = {
+                            "activo": True,
+                            "paginas_caratula": paginas_caratula,
+                            "pag_inicio": pag_inicio,
+                            "pag_fin": pag_fin,
+                            "nombre_recortado": nombre_recortado,
+                            "subido": bitstream_recortado_subido,
+                            "subido_a_rdu": bitstream_recortado_subido,
+                            "uuid": nuevo_uuid_recorte,
+                        }
+                        info_adjunto["recorte_libro"] = recorte_info
+                        info_adjunto["nombre_pdf"] = nombre_recortado
 
-                    # Usar el PDF recortado para la extracción de texto
-                    pdf_bytes = pdf_recortado
-                    reader = PdfReader(io.BytesIO(pdf_recortado))
-                    num_paginas = len(reader.pages)
-                except Exception as ex_recorte:
-                    print(f"  [WARN] Falló el recorte de parte de libro: {ex_recorte}", file=sys.stderr)
+                        # Usar el PDF recortado para la extracción de texto
+                        pdf_bytes = pdf_recortado
+                        reader = PdfReader(io.BytesIO(pdf_recortado))
+                        num_paginas = len(reader.pages)
+                    except Exception as ex_recorte:
+                        print(f"  [WARN] Falló el recorte de parte de libro: {ex_recorte}", file=sys.stderr)
+                        recorte_info = None
 
-        # Extracción de texto
-        texto = ""
-        # Si fue recortado, saltar las páginas de carátula/índice para darle a DeepSeek el inicio del capítulo
-        if recorte_info and recorte_info.get("activo"):
-            inicio_cap = len(recorte_info["paginas_caratula"])
-            for p in reader.pages[inicio_cap : inicio_cap + 4]:
-                texto += (p.extract_text() or "") + "\n"
-        else:
-            for p in reader.pages[:4]:
-                texto += (p.extract_text() or "") + "\n"
+            # Extracción de texto
+            texto = ""
+            # Si fue recortado, saltar las páginas de carátula/índice para darle a DeepSeek el inicio del capítulo
+            if recorte_info and recorte_info.get("activo"):
+                inicio_cap = len(recorte_info["paginas_caratula"])
+                if inicio_cap < len(reader.pages):
+                    for p in reader.pages[inicio_cap : inicio_cap + 4]:
+                        texto += (p.extract_text() or "") + "\n"
 
-        texto = texto.strip()
-        print(f"  [TEXTO] Extraídos {len(texto)} caracteres de {min(4, num_paginas)} página(s).", file=sys.stderr)
-        if not texto:
-            return "", f"PDF IMAGEN ESCANEADA / SIN TEXTO EXTRAIBLE ({num_paginas} págs)", info_adjunto
+            # Si no hubo recorte o si la extracción a partir de inicio_cap no dio texto, leer las primeras 4 páginas
+            if not texto.strip():
+                for p in reader.pages[:4]:
+                    texto += (p.extract_text() or "") + "\n"
 
-        prefijos = []
-        if info_adjunto.get("convertido_de_docx"):
-            prefijos.append(f"DOCX CONVERTIDO A PDF: {info_adjunto['nombre_pdf']}")
-        if recorte_info and recorte_info.get("activo"):
-            prefijos.append(f"PARTE DE LIBRO RECORTADA: págs. {recorte_info['pag_inicio']}-{recorte_info['pag_fin']}")
+            texto = texto.strip()
+            print(f"  [TEXTO] Extraídos {len(texto)} caracteres de {min(4, num_paginas)} página(s).", file=sys.stderr)
+            if not texto:
+                ultimo_error = f"PDF IMAGEN ESCANEADA / SIN TEXTO EXTRAIBLE ({num_paginas} págs)"
+                print(f"  [AVISO] Archivo '{nombre_candidato}' ({num_paginas} págs) sin texto extraíble. Evaluando siguiente candidato si existe...", file=sys.stderr)
+                continue
 
-        tag_det = f" [{'; '.join(prefijos)}]" if prefijos else ""
-        return texto, f"OK{tag_det} ({len(texto)} chars de {min(4, num_paginas)} págs)", info_adjunto
-    except Exception as e:
-        return "", f"ERROR AL PARSEAR PDF: {e}", info_adjunto
+            prefijos = []
+            if info_adjunto.get("convertido_de_docx"):
+                prefijos.append(f"DOCX CONVERTIDO A PDF: {info_adjunto['nombre_pdf']}")
+            if recorte_info and recorte_info.get("activo"):
+                prefijos.append(f"PARTE DE LIBRO RECORTADA: págs. {recorte_info['pag_inicio']}-{recorte_info['pag_fin']}")
+
+            tag_det = f" [{'; '.join(prefijos)}]" if prefijos else ""
+            return texto, f"OK{tag_det} ({len(texto)} chars de {min(4, num_paginas)} págs)", info_adjunto
+        except Exception as e:
+            ultimo_error = f"ERROR AL PARSEAR PDF '{nombre_candidato}': {e}"
+            print(f"  [AVISO] Error al parsear '{nombre_candidato}': {e}. Probando siguiente archivo si existe...", file=sys.stderr)
+            continue
+
+    return "", ultimo_error or "SIN ARCHIVOS ADJUNTOS CON TEXTO EXTRAÍBLE", info_vacia
 
 
 def es_token_inicial_secundaria(token: str) -> bool:
