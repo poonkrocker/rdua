@@ -47,7 +47,7 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 from openai import OpenAI
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 # Importar reglas de formato institucional de RDU
 try:
@@ -392,6 +392,21 @@ def obtener_info_workflowitem(client: httpx.Client, wf_id: str) -> dict:
     fechas = extraer_campo_metadatos(sections, md, ["dc.date.issued", "dc.date"])
     fecha = fechas[0] if fechas else ""
 
+    tipos = extraer_campo_metadatos(sections, md, ["dc.type"])
+    tipo_documento = tipos[0] if tipos else ""
+
+    pags_ini = extraer_campo_metadatos(sections, md, ["dc.relation.firstpage"])
+    pags_fin = extraer_campo_metadatos(sections, md, ["dc.relation.lastpage"])
+    citas = extraer_campo_metadatos(sections, md, ["dc.bibliographicCitation", "dc.format.extent"])
+
+    rango_paginas = None
+    if pags_ini and pags_fin and pags_ini[0].isdigit() and pags_fin[0].isdigit():
+        rango_paginas = (int(pags_ini[0]), int(pags_fin[0]))
+    elif citas:
+        m_cita = re.search(r"p[págs\.]*\s*(\d+)\s*[-–—]\s*(\d+)", citas[0], re.I)
+        if m_cita:
+            rango_paginas = (int(m_cita.group(1)), int(m_cita.group(2)))
+
     pool_id = buscar_pooltask_id(client, uuid) if uuid else ""
     claimed_id = ""
     if not pool_id and uuid:
@@ -407,6 +422,8 @@ def obtener_info_workflowitem(client: httpx.Client, wf_id: str) -> dict:
         "autores": autores,
         "resumen": resumen,
         "fecha": fecha,
+        "tipo_documento": tipo_documento,
+        "rango_paginas_md": rango_paginas,
         "link_workflow": f"{BASE_URL}/workflowitems/{wf_id}/edit",
         "link_item": f"{BASE_URL}/items/{uuid}" if uuid else "",
     }
@@ -688,14 +705,179 @@ def eliminar_bitstream(client: httpx.Client, bitstream_uuid: str) -> bool:
         return False
 
 
+def _normalizar_texto_busqueda(texto: str) -> str:
+    """Normaliza texto para búsquedas eliminando acentos, puntuación y mayúsculas."""
+    if not texto:
+        return ""
+    t = texto.lower()
+    t = re.sub(r"[áàäâ]", "a", t)
+    t = re.sub(r"[éèëê]", "e", t)
+    t = re.sub(r"[íìïî]", "i", t)
+    t = re.sub(r"[óòöô]", "o", t)
+    t = re.sub(r"[úùüû]", "u", t)
+    t = re.sub(r"[ñ]", "n", t)
+    t = re.sub(r"[^\w\s]", " ", t)
+    return " ".join(t.split())
+
+
+def _extraer_palabras_clave(texto: str) -> list[str]:
+    """Extrae palabras clave significativas de un título."""
+    norm = _normalizar_texto_busqueda(texto)
+    stop = {
+        "para", "sobre", "desde", "hacia", "segun", "entre", "contra",
+        "donde", "cuando", "como", "este", "esta", "estos", "estas",
+        "segundo", "primer", "tercero", "informe", "articulo", "capitulo",
+        "seccion", "parte", "libro", "revista", "editorial", "universidad",
+        "provincial", "nacional", "argentina", "cordoba",
+    }
+    palabras = [w for w in norm.split() if len(w) >= 4 and w not in stop]
+    return palabras
+
+
+def recortar_pdf_capitulo(
+    pdf_bytes: bytes,
+    paginas_caratula: list[int],
+    pag_inicio: int,
+    pag_fin: int,
+) -> bytes:
+    """Extrae las páginas de carátula/índice más las páginas del capítulo [pag_inicio..pag_fin]
+    y genera un nuevo PDF binario en memoria usando pypdf.
+    Las páginas vienen 1-indexadas (1 = primera página).
+    """
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    writer = PdfWriter()
+    total = len(reader.pages)
+
+    seleccionadas = []
+    for p in paginas_caratula:
+        if 1 <= p <= total and p not in seleccionadas:
+            seleccionadas.append(p)
+    for p in range(pag_inicio, pag_fin + 1):
+        if 1 <= p <= total and p not in seleccionadas:
+            seleccionadas.append(p)
+
+    for p in seleccionadas:
+        writer.add_page(reader.pages[p - 1])
+
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def localizar_capitulo_en_pdf(
+    reader: PdfReader,
+    titulo_rdu: str,
+    autores_rdu: list[str] | None = None,
+    rango_sugerido: tuple[int, int] | None = None,
+) -> tuple[list[int], int, int] | None:
+    """Detecta si un PDF extenso contiene un capítulo/sección específico que coincide
+    con el título y/o autores de RDU, en lugar de ser un documento individual.
+    Retorna (paginas_caratula, pag_inicio, pag_fin) en numeración 1-indexada, o None.
+    """
+    total_paginas = len(reader.pages)
+    if total_paginas <= 4 or not titulo_rdu:
+        return None
+
+    # 1. Si ya se suministró un rango válido desde metadatos
+    if rango_sugerido and len(rango_sugerido) == 2:
+        p_ini, p_fin = rango_sugerido
+        if 1 <= p_ini <= total_paginas and p_ini <= p_fin <= total_paginas:
+            paginas_caratula = [1, 2] if p_ini > 2 else [1]
+            return paginas_caratula, p_ini, p_fin
+
+    palabras_clave_tit = _extraer_palabras_clave(titulo_rdu)
+    if not palabras_clave_tit:
+        return None
+
+    apellidos_autores = []
+    for a in (autores_rdu or []):
+        ap = a.split(",")[0].strip() if "," in a else a.strip()
+        ap_norm = _normalizar_texto_busqueda(ap)
+        if len(ap_norm) >= 3:
+            apellidos_autores.append(ap_norm)
+
+    textos_paginas = []
+    for i in range(total_paginas):
+        try:
+            txt = reader.pages[i].extract_text() or ""
+        except Exception:
+            txt = ""
+        textos_paginas.append(_normalizar_texto_busqueda(txt))
+
+    # Si la primera página ya contiene la mayoría de las palabras clave del título
+    # y los autores de RDU, se trata de un artículo independiente, no de un libro para recortar
+    txt_p1 = textos_paginas[0] if textos_paginas else ""
+    coincidencias_p1 = sum(1 for w in palabras_clave_tit if w in txt_p1)
+    if len(palabras_clave_tit) > 0 and (coincidencias_p1 / len(palabras_clave_tit)) >= 0.75:
+        if not apellidos_autores or any(ap in txt_p1 for ap in apellidos_autores):
+            return None
+
+    mejor_pag = None
+    mejor_score = 0.0
+
+    for idx, txt in enumerate(textos_paginas):
+        p_num = idx + 1
+        if not txt:
+            continue
+
+        coincidencias = sum(1 for w in palabras_clave_tit if w in txt)
+        ratio_tit = coincidencias / len(palabras_clave_tit) if palabras_clave_tit else 0
+        coincidencias_aut = sum(1 for ap in apellidos_autores if ap in txt)
+
+        es_indice = any(ind in txt for ind in ["indice", "tabla de contenido", "sumario"])
+        score = ratio_tit * 10.0 + (coincidencias_aut * 5.0)
+
+        # Si es página de índice o carátula, penalizar para no confundir el índice con el capítulo
+        if es_indice or p_num <= 2:
+            score *= 0.2
+
+        if ratio_tit >= 0.6 and score > mejor_score:
+            mejor_score = score
+            mejor_pag = p_num
+
+    if not mejor_pag or mejor_pag <= 2 or mejor_score < 4.0:
+        return None
+
+    pag_inicio = mejor_pag
+
+    # Detección de fin del capítulo (pag_fin)
+    txt_inicio = textos_paginas[pag_inicio - 1]
+    m_sec = re.search(r"\b(\d+)\s*[\.\,\-]\s*(\d+)\b", txt_inicio)
+    patron_sig = None
+    if m_sec:
+        n_mayor = int(m_sec.group(1))
+        n_menor = int(m_sec.group(2))
+        patron_sig = rf"\b{n_mayor}\s*[\.\,\-]\s*{n_menor + 1}\b"
+
+    pag_fin = min(total_paginas, pag_inicio + 25)
+
+    for p in range(pag_inicio, min(total_paginas, pag_inicio + 35)):
+        txt_sig = textos_paginas[p]
+        p_num_sig = p + 1
+
+        if patron_sig and re.search(patron_sig, txt_sig):
+            pag_fin = p_num_sig
+            break
+
+    if pag_fin < pag_inicio:
+        pag_fin = pag_inicio
+
+    paginas_caratula = [1, 2] if total_paginas >= 2 else [1]
+    return paginas_caratula, pag_inicio, pag_fin
+
+
 def descargar_y_extraer_texto_pdf(
     client: httpx.Client,
     wf_id: str,
     item_uuid: str,
     dry_run: bool = False,
+    titulo_rdu: str = "",
+    autores_rdu: list[str] | None = None,
+    rango_sugerido: tuple[int, int] | None = None,
 ) -> tuple[str, str, dict]:
-    """Descarga el PDF (o convierte Word doc/docx a PDF si es necesario)
-    y extrae texto de las primeras páginas.
+    """Descarga el PDF (o convierte Word doc/docx a PDF si es necesario),
+    detecta si es un libro completo para recortar el capítulo correspondiente
+    y extrae texto de las primeras páginas del trabajo.
     Retorna (texto_extraido, detalle_o_error, info_adjunto).
     """
     info_vacia = {
@@ -704,6 +886,7 @@ def descargar_y_extraer_texto_pdf(
         "nombre_pdf": "",
         "subido_a_rdu": False,
         "bitstream_uuid": None,
+        "recorte_libro": None,
     }
     archivos = obtener_archivos_workflowitem(client, wf_id, item_uuid)
     if not archivos:
@@ -768,6 +951,7 @@ def descargar_y_extraer_texto_pdf(
         "nombre_pdf": nombre_candidato,
         "subido_a_rdu": False,
         "bitstream_uuid": None,
+        "recorte_libro": None,
     }
 
     if es_docx:
@@ -805,22 +989,95 @@ def descargar_y_extraer_texto_pdf(
             "nombre_pdf": nombre_pdf,
             "subido_a_rdu": bitstream_subido,
             "bitstream_uuid": nuevo_uuid,
+            "recorte_libro": None,
         }
 
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         num_paginas = len(reader.pages)
+        recorte_info = None
+
+        # DETECCIÓN Y RECORTE DE PARTE DE LIBRO (BOOKPART) EN PDFS EXTENSOS
+        if num_paginas > 4 and titulo_rdu:
+            loc = localizar_capitulo_en_pdf(reader, titulo_rdu, autores_rdu, rango_sugerido)
+            if loc:
+                paginas_caratula, pag_inicio, pag_fin = loc
+                print(
+                    f"  [PARTE DE LIBRO] Detectado capítulo en págs. {pag_inicio}-{pag_fin} "
+                    f"(carátula: págs. {paginas_caratula}) de un total de {num_paginas} págs.",
+                    file=sys.stderr,
+                )
+                try:
+                    pdf_recortado = recortar_pdf_capitulo(pdf_bytes, paginas_caratula, pag_inicio, pag_fin)
+                    base_nom = re.sub(r"\.(pdf|docx?|doc)$", "", info_adjunto["nombre_pdf"], flags=re.I)
+                    nombre_recortado = f"{base_nom}_p{pag_inicio}-{pag_fin}.pdf"
+
+                    bitstream_recortado_subido = False
+                    nuevo_uuid_recorte = None
+                    if not dry_run:
+                        bundle_uuid = candidato.get("bundle_uuid") or obtener_bundle_original_uuid(client, item_uuid)
+                        if bundle_uuid:
+                            print(
+                                f"  [SUBIDA] Subiendo PDF recortado '{nombre_recortado}' ({len(pdf_recortado)} B) al bundle ORIGINAL...",
+                                file=sys.stderr,
+                            )
+                            nuevo_uuid_recorte = subir_bitstream_a_bundle(
+                                client, bundle_uuid, nombre_recortado, pdf_recortado
+                            )
+                            if nuevo_uuid_recorte:
+                                bitstream_recortado_subido = True
+                        else:
+                            print(f"  [WARN] No se localizó bundle ORIGINAL para subir PDF recortado.", file=sys.stderr)
+                    else:
+                        print(
+                            f"  [SIMULACIÓN] Se subiría el PDF recortado '{nombre_recortado}' ({len(pdf_recortado)} B) al bundle ORIGINAL.",
+                            file=sys.stderr,
+                        )
+
+                    recorte_info = {
+                        "activo": True,
+                        "paginas_caratula": paginas_caratula,
+                        "pag_inicio": pag_inicio,
+                        "pag_fin": pag_fin,
+                        "nombre_recortado": nombre_recortado,
+                        "subido": bitstream_recortado_subido,
+                        "subido_a_rdu": bitstream_recortado_subido,
+                        "uuid": nuevo_uuid_recorte,
+                    }
+                    info_adjunto["recorte_libro"] = recorte_info
+                    info_adjunto["nombre_pdf"] = nombre_recortado
+
+                    # Usar el PDF recortado para la extracción de texto
+                    pdf_bytes = pdf_recortado
+                    reader = PdfReader(io.BytesIO(pdf_recortado))
+                    num_paginas = len(reader.pages)
+                except Exception as ex_recorte:
+                    print(f"  [WARN] Falló el recorte de parte de libro: {ex_recorte}", file=sys.stderr)
+
+        # Extracción de texto
         texto = ""
-        for p in reader.pages[:4]:
-            texto += (p.extract_text() or "") + "\n"
+        # Si fue recortado, saltar las páginas de carátula/índice para darle a DeepSeek el inicio del capítulo
+        if recorte_info and recorte_info.get("activo"):
+            inicio_cap = len(recorte_info["paginas_caratula"])
+            for p in reader.pages[inicio_cap : inicio_cap + 4]:
+                texto += (p.extract_text() or "") + "\n"
+        else:
+            for p in reader.pages[:4]:
+                texto += (p.extract_text() or "") + "\n"
 
         texto = texto.strip()
         print(f"  [TEXTO] Extraídos {len(texto)} caracteres de {min(4, num_paginas)} página(s).", file=sys.stderr)
         if not texto:
             return "", f"PDF IMAGEN ESCANEADA / SIN TEXTO EXTRAIBLE ({num_paginas} págs)", info_adjunto
 
-        prefijo_det = f"OK [DOCX CONVERTIDO A PDF: {info_adjunto['nombre_pdf']}]" if info_adjunto.get("convertido_de_docx") else "OK"
-        return texto, f"{prefijo_det} ({len(texto)} chars de {min(4, num_paginas)} págs)", info_adjunto
+        prefijos = []
+        if info_adjunto.get("convertido_de_docx"):
+            prefijos.append(f"DOCX CONVERTIDO A PDF: {info_adjunto['nombre_pdf']}")
+        if recorte_info and recorte_info.get("activo"):
+            prefijos.append(f"PARTE DE LIBRO RECORTADA: págs. {recorte_info['pag_inicio']}-{recorte_info['pag_fin']}")
+
+        tag_det = f" [{'; '.join(prefijos)}]" if prefijos else ""
+        return texto, f"OK{tag_det} ({len(texto)} chars de {min(4, num_paginas)} págs)", info_adjunto
     except Exception as e:
         return "", f"ERROR AL PARSEAR PDF: {e}", info_adjunto
 
@@ -1534,8 +1791,16 @@ def procesar_flujo(
             print(f"  Autores RDU: {autores_rdu}")
             print(f"  UUID: {uuid or '(no encontrado)'} | Workflowitem: {wf_id}")
 
-            # Descargar PDF y extraer texto (busca en upload sections y en bundles, convierte docx si aplica)
-            texto_pdf, det_pdf, info_adjunto = descargar_y_extraer_texto_pdf(client, wf_id, uuid, dry_run=dry_run)
+            # Descargar PDF y extraer texto (busca en upload sections y en bundles, convierte docx si aplica, recorta bookparts)
+            texto_pdf, det_pdf, info_adjunto = descargar_y_extraer_texto_pdf(
+                client,
+                wf_id,
+                uuid,
+                dry_run=dry_run,
+                titulo_rdu=titulo_rdu,
+                autores_rdu=autores_rdu,
+                rango_sugerido=item.get("rango_paginas_md"),
+            )
             if not texto_pdf:
                 print(f"  [OMITIDO] No se pudo extraer texto del PDF: {det_pdf}")
                 reportar_col_c(f"OMITIDO: {det_pdf}")
@@ -1708,14 +1973,26 @@ def procesar_flujo(
                     else:
                         nota_adj = f"; adjunto Word '{info_adjunto['nombre_original']}' convertido y subido como '{info_adjunto['nombre_pdf']}'"
 
+                nota_rec_sin_autor = ""
+                prefijo_recorte_sin_autor = ""
+                recorte_libro = info_adjunto.get("recorte_libro")
+                if recorte_libro and recorte_libro.get("activo"):
+                    p_ini = recorte_libro["pag_inicio"]
+                    p_fin = recorte_libro["pag_fin"]
+                    prefijo_recorte_sin_autor = f"[PARTE DE LIBRO RECORTADA: págs. 1-2, {p_ini}-{p_fin}] "
+                    if dry_run:
+                        nota_rec_sin_autor = f"; capítulo recortado (págs. 1-2, {p_ini}-{p_fin}) (simulado)"
+                    else:
+                        nota_rec_sin_autor = f"; capítulo recortado (págs. 1-2, {p_ini}-{p_fin}) y subido como '{recorte_libro['nombre_recortado']}'"
+
                 if cambio_titulo:
                     if son_titulos_equivalentes(titulo_rdu, titulo_nuevo):
                         desc_tit = "se estandarizó el formato del título (minúsculas y ' : ')"
                     else:
                         desc_tit = "se corrigió el título según PDF"
-                    modificaciones = f"[PDF SIN AUTOR] Modificaciones: {desc_tit}; {motivo_sin_autor}{det_rdu}{nota_adj}"
+                    modificaciones = f"[PDF SIN AUTOR] Modificaciones: {desc_tit}; {motivo_sin_autor}{det_rdu}{nota_adj}{nota_rec_sin_autor}"
                 else:
-                    modificaciones = f"[PDF SIN AUTOR] {motivo_sin_autor}{det_rdu}; metadatos de título coincidentes{nota_adj}"
+                    modificaciones = f"[PDF SIN AUTOR] {motivo_sin_autor}{det_rdu}; metadatos de título coincidentes{nota_adj}{nota_rec_sin_autor}"
 
                 print(f"  [ALERTA PDF SIN AUTOR]: {modificaciones}")
                 if cambio_titulo:
@@ -1723,7 +2000,7 @@ def procesar_flujo(
 
                 if dry_run:
                     print("  [SIMULACIÓN] No se escriben cambios en RDU (dry-run activo).")
-                    reportar_col_c(f"[SIMULACIÓN] {modificaciones}")
+                    reportar_col_c(f"[SIMULACIÓN] {prefijo_recorte_sin_autor}{modificaciones}")
                     filas_reporte.append({
                         "Fecha": datetime.now().isoformat(),
                         "Workflowitem_ID": wf_id,
@@ -1848,7 +2125,25 @@ def procesar_flujo(
                 else:
                     nota_adjunto = f"adjunto Word '{info_adjunto['nombre_original']}' convertido y subido como '{info_adjunto['nombre_pdf']}'"
 
-            hay_cambios = cambio_titulo or cambio_autores or info_adjunto.get("subido_a_rdu") or (dry_run and info_adjunto.get("convertido_de_docx"))
+            recorte_libro = info_adjunto.get("recorte_libro")
+            nota_recorte = ""
+            prefijo_recorte_col_c = ""
+            if recorte_libro and recorte_libro.get("activo"):
+                p_ini = recorte_libro["pag_inicio"]
+                p_fin = recorte_libro["pag_fin"]
+                prefijo_recorte_col_c = f"[PARTE DE LIBRO RECORTADA: págs. 1-2, {p_ini}-{p_fin}] "
+                if dry_run:
+                    nota_recorte = f"capítulo de libro recortado (págs. 1-2, {p_ini}-{p_fin}) (simulado)"
+                else:
+                    nota_recorte = f"capítulo de libro recortado (págs. 1-2, {p_ini}-{p_fin}) y subido como '{recorte_libro['nombre_recortado']}'"
+
+            hay_cambios = (
+                cambio_titulo
+                or cambio_autores
+                or info_adjunto.get("subido_a_rdu")
+                or (dry_run and info_adjunto.get("convertido_de_docx"))
+                or (recorte_libro and (recorte_libro.get("subido_a_rdu") or recorte_libro.get("subido") or (dry_run and recorte_libro.get("activo"))))
+            )
             if not hay_cambios:
                 print("  [OK] Metadatos coincidentes (formato institucional RDU y filiaciones validadas), NO se requieren modificaciones.")
                 if not dry_run:
@@ -1900,10 +2195,18 @@ def procesar_flujo(
                 else:
                     modificaciones = f"Modificaciones: se corrigió el título según PDF; {desc_autores}"
             else:
-                modificaciones = f"Modificaciones: {nota_adjunto}"
+                modificaciones = "Modificaciones:"
 
-            if nota_adjunto and (cambio_titulo or cambio_autores):
-                modificaciones = f"{modificaciones}; {nota_adjunto}"
+            notas_extra = []
+            if nota_adjunto:
+                notas_extra.append(nota_adjunto)
+            if nota_recorte:
+                notas_extra.append(nota_recorte)
+            if notas_extra:
+                if modificaciones == "Modificaciones:":
+                    modificaciones = f"Modificaciones: {'; '.join(notas_extra)}"
+                else:
+                    modificaciones = f"{modificaciones}; {'; '.join(notas_extra)}"
 
             print(f"  [CAMBIOS DETECTADOS]: {modificaciones}")
             if cambio_titulo:
@@ -1913,7 +2216,7 @@ def procesar_flujo(
 
             if dry_run:
                 print("  [SIMULACIÓN] No se escriben cambios en RDU (dry-run activo).")
-                reportar_col_c(f"[SIMULACIÓN] {modificaciones}")
+                reportar_col_c(f"[SIMULACIÓN] {prefijo_recorte_col_c}{modificaciones}")
                 filas_reporte.append({
                     "Fecha": datetime.now().isoformat(),
                     "Workflowitem_ID": wf_id,
@@ -1924,7 +2227,7 @@ def procesar_flujo(
                     "Autores_Nuevos": "; ".join(autores_nuevos),
                     "Autores_Sin_Filiacion": texto_col_d,
                     "Buscar_Filiaciones": texto_col_e,
-                    "Modificaciones": modificaciones,
+                    "Modificaciones": f"{prefijo_recorte_col_c}{modificaciones}".strip(),
                     "Accion": "SIMULADO_CORREGIDO",
                     "Link_Workflow": item.get("link_workflow") or link_origen,
                     "Link_Item": item.get("link_item") or "",
@@ -1963,7 +2266,7 @@ def procesar_flujo(
                     else:
                         print(f"  [ASIGNADA] La tarea permanece asignada al usuario (claimedtask_id: {claimed_id}).")
 
-                    reportar_col_c(modificaciones)
+                    reportar_col_c(f"{prefijo_recorte_col_c}{modificaciones}")
                     filas_reporte.append({
                         "Fecha": datetime.now().isoformat(),
                         "Workflowitem_ID": wf_id,
@@ -1974,7 +2277,7 @@ def procesar_flujo(
                         "Autores_Nuevos": a_fin,
                         "Autores_Sin_Filiacion": texto_col_d,
                         "Buscar_Filiaciones": texto_col_e,
-                        "Modificaciones": modificaciones,
+                        "Modificaciones": f"{prefijo_recorte_col_c}{modificaciones}".strip(),
                         "Accion": "MODIFICADO_Y_DEVUELTO_AL_POOL" if devolver_al_pool else "MODIFICADO_Y_ASIGNADO",
                         "Link_Workflow": item.get("link_workflow") or link_origen,
                         "Link_Item": item.get("link_item") or "",
