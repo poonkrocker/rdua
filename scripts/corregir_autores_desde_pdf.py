@@ -848,15 +848,22 @@ def localizar_capitulo_en_pdf(
         n_mayor = int(m_sec.group(1))
         n_menor = int(m_sec.group(2))
         patron_sig = rf"\b{n_mayor}\s*[\.\,\-]\s*{n_menor + 1}\b"
+    else:
+        m_cap = re.search(r"\b(?:cap[íi]tulo\s*)?(\d{1,2})\b[\.\s\-]+", txt_inicio, re.I)
+        if m_cap:
+            n_cap = int(m_cap.group(1))
+            patron_sig = rf"\b(?:cap[íi]tulo\s*)?{n_cap + 1}\b[\.\s\-]+"
 
-    pag_fin = min(total_paginas, pag_inicio + 25)
+    pag_fin = min(total_paginas, pag_inicio + 20)
 
     for p in range(pag_inicio, min(total_paginas, pag_inicio + 35)):
         txt_sig = textos_paginas[p]
         p_num_sig = p + 1
 
-        if patron_sig and re.search(patron_sig, txt_sig):
-            pag_fin = p_num_sig
+        if (patron_sig and re.search(patron_sig, txt_sig)) or re.search(r"\bparte\s*\d+\b", txt_sig):
+            pag_fin = max(pag_inicio, p_num_sig - 1)
+            if pag_fin > pag_inicio and len(textos_paginas[pag_fin - 1].strip()) < 300:
+                pag_fin = pag_fin - 1
             break
 
     if pag_fin < pag_inicio:
@@ -864,6 +871,196 @@ def localizar_capitulo_en_pdf(
 
     paginas_caratula = [1, 2] if total_paginas >= 2 else [1]
     return paginas_caratula, pag_inicio, pag_fin
+
+
+def extraer_preliminares_para_indice(reader: PdfReader, max_pags: int = 18) -> list[tuple[int, str]]:
+    """Extrae el texto de las primeras páginas del documento para ubicar el índice."""
+    paginas_texto = []
+    limite = min(max_pags, len(reader.pages))
+    for i in range(limite):
+        p_num = i + 1
+        try:
+            txt = reader.pages[i].extract_text() or ""
+        except Exception:
+            txt = ""
+        paginas_texto.append((p_num, txt))
+    return paginas_texto
+
+
+def localizar_capitulo_con_indice_deepseek(
+    client_ai: OpenAI,
+    model: str,
+    reader: PdfReader,
+    titulo_rdu: str,
+    autores_rdu: list[str] | None = None,
+    total_paginas: int = 0,
+) -> tuple[list[int], int, int] | None:
+    """Usa DeepSeek para leer el índice/sumario de las páginas preliminares del PDF
+    y determinar exactamente dónde empieza y termina el capítulo de libro.
+    Retorna (paginas_caratula, pag_inicio_fisica, pag_fin_fisica) o None si no corresponde.
+    """
+    if not client_ai or not titulo_rdu or total_paginas <= 4:
+        return None
+
+    prelims = extraer_preliminares_para_indice(reader, max_pags=18)
+    if not prelims:
+        return None
+
+    bloques = []
+    paginas_con_indice = []
+    for p_num, txt in prelims:
+        t_clean = txt.strip()
+        if not t_clean:
+            continue
+        bloques.append(f"=== PÁGINA FÍSICA {p_num} DEL PDF ===\n{t_clean}")
+        t_lower = t_clean.lower()
+        if any(w in t_lower for w in ["indice", "índice", "sumario", "tabla de contenido", "contenido", "table of contents"]):
+            paginas_con_indice.append(p_num)
+
+    if not bloques:
+        return None
+
+    texto_preliminares = "\n\n".join(bloques)
+
+    system_prompt = (
+        "Sos un bibliotecario y catalogador bibliográfico experto del Repositorio Digital Universitario (RDU - Universidad Nacional de Córdoba, Argentina).\n"
+        "Estás analizando el texto de las páginas preliminares e ÍNDICE / SUMARIO / TABLA DE CONTENIDO de un libro completo en PDF para identificar y recortar un capítulo específico (bookpart).\n"
+        "Cada página física del archivo PDF está etiquetada con '=== PÁGINA FÍSICA X DEL PDF ==='.\n\n"
+        "TAREA:\n"
+        "1. Analizar el índice/sumario del libro para verificar si contiene el capítulo o sección correspondiente al trabajo registrado en RDU (cotejando título y/o autores).\n"
+        "2. Si SÍ está en el índice:\n"
+        "   - 'es_capitulo_de_libro': true\n"
+        "   - 'titulo_en_indice': título exacto tal como figura en el índice\n"
+        "   - 'autores_en_indice': autores del capítulo según el índice\n"
+        "   - 'pagina_inicio_impresa': número de página IMPRESA donde comienza el capítulo según el índice (ej: 44)\n"
+        "   - 'siguiente_item_titulo': título del siguiente capítulo, parte o sección que le sigue en el índice (ej: 'Parte 2. Sociabilidades, consumos de drogas y cuidados' o '4. Experiencias comunitarias...')\n"
+        "   - 'siguiente_item_pagina_impresa': número de página IMPRESA donde comienza el siguiente elemento según el índice (ej: 56)\n"
+        "   - 'pagina_fin_impresa': página IMPRESA exacta donde termina este capítulo.\n"
+        "     * REGLAS PARA DETERMINAR 'pagina_fin_impresa':\n"
+        "       - Un capítulo termina justo en la página anterior a donde comienza el siguiente capítulo o separador de parte/sección.\n"
+        "       - CASO CON SEPARADOR DE PARTE: Si el capítulo empieza en la pág. 44 y el siguiente capítulo empieza en la pág. 56, pero antes del siguiente capítulo hay un separador/portadilla de 'Parte 2' (pág. 55), el capítulo termina en la pág. 54.\n"
+        "       - CASO SIN SEPARADOR: Si el capítulo 1 empieza en la pág. 16 y el capítulo 2 empieza en la pág. 30, el capítulo 1 termina en la pág. 29 (o 28 si hay página en blanco).\n"
+        "       - CASO ÚLTIMO CAPÍTULO: Si es el último capítulo del libro, colocar la última página del texto del capítulo antes de anexos generales o fin del libro.\n"
+        "   - 'paginas_caratula_fisicas': lista de números de páginas FÍSICAS del PDF que contienen la portada institucional del libro y la página del índice (ej: [1, 2] o [1, 3]) para preservarlas al inicio del PDF recortado.\n"
+        "3. Si NO se trata de un libro con capítulos o el trabajo NO figura en el índice:\n"
+        "   - 'es_capitulo_de_libro': false\n\n"
+        "FORMATO DE RESPUESTA OBLIGATORIO (JSON ESTRICTO):\n"
+        "{\n"
+        '  "es_capitulo_de_libro": true,\n'
+        '  "titulo_en_indice": "...",\n'
+        '  "autores_en_indice": ["..."],\n'
+        '  "pagina_inicio_impresa": 44,\n'
+        '  "pagina_fin_impresa": 54,\n'
+        '  "siguiente_item_titulo": "...",\n'
+        '  "siguiente_item_pagina_impresa": 56,\n'
+        '  "paginas_caratula_fisicas": [1, 2],\n'
+        '  "explicacion": "Breve fundamentación del rango determinado según el índice"\n'
+        "}"
+    )
+
+    autores_str = ", ".join(autores_rdu) if autores_rdu else "(no especificados)"
+    user_prompt = (
+        f"Título buscado en RDU: {titulo_rdu}\n"
+        f"Autores buscados en RDU: {autores_str}\n"
+        f"Total de páginas del PDF: {total_paginas}\n\n"
+        f"TEXTO DE PÁGINAS PRELIMINARES E ÍNDICE DEL PDF:\n"
+        f"{texto_preliminares[:16000]}"
+    )
+
+    try:
+        resp = client_ai.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=800,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        limpio = raw.replace("```json", "").replace("```", "").strip()
+        m = re.search(r"\{.*\}", limpio, re.DOTALL)
+        res_dict = json.loads(m.group(0)) if m else json.loads(limpio)
+        if not isinstance(res_dict, dict) or not res_dict.get("es_capitulo_de_libro"):
+            return None
+
+        p_ini_imp = res_dict.get("pagina_inicio_impresa")
+        p_fin_imp = res_dict.get("pagina_fin_impresa")
+        if not isinstance(p_ini_imp, int) or not isinstance(p_fin_imp, int):
+            return None
+
+        print(
+            f"  [DEEPSEEK ÍNDICE] Encontrado en índice: '{res_dict.get('titulo_en_indice')}' "
+            f"| Rango impreso: págs. {p_ini_imp}-{p_fin_imp} | Sig: '{res_dict.get('siguiente_item_titulo')}' "
+            f"(pág. {res_dict.get('siguiente_item_pagina_impresa')}) | Explicación: {res_dict.get('explicacion')}",
+            file=sys.stderr,
+        )
+
+        palabras_clave = _extraer_palabras_clave(titulo_rdu)
+        mejor_pag_fisica = None
+        offset = 0
+
+        if 1 <= p_ini_imp <= total_paginas:
+            txt_prueba = _normalizar_texto_busqueda(reader.pages[p_ini_imp - 1].extract_text() or "")
+            coincidencias = sum(1 for w in palabras_clave if w in txt_prueba)
+            if len(palabras_clave) > 0 and (coincidencias / len(palabras_clave)) >= 0.4:
+                mejor_pag_fisica = p_ini_imp
+                offset = 0
+
+        if mejor_pag_fisica is None:
+            ventana_min = max(1, p_ini_imp - 15)
+            ventana_max = min(total_paginas, p_ini_imp + 25)
+            mejor_score = 0.0
+            for cand in range(ventana_min, ventana_max + 1):
+                txt_cand = _normalizar_texto_busqueda(reader.pages[cand - 1].extract_text() or "")
+                coincidencias = sum(1 for w in palabras_clave if w in txt_cand)
+                ratio = coincidencias / len(palabras_clave) if palabras_clave else 0
+                if ratio > mejor_score and ratio >= 0.4:
+                    mejor_score = ratio
+                    mejor_pag_fisica = cand
+            if mejor_pag_fisica is not None:
+                offset = mejor_pag_fisica - p_ini_imp
+            else:
+                mejor_pag_fisica = p_ini_imp
+                offset = 0
+
+        pag_inicio_fisica = mejor_pag_fisica
+        pag_fin_fisica = max(pag_inicio_fisica, min(total_paginas, p_fin_imp + offset))
+
+        p_sig_imp = res_dict.get("siguiente_item_pagina_impresa")
+        if isinstance(p_sig_imp, int) and p_sig_imp > p_ini_imp:
+            pag_sig_fisica = p_sig_imp + offset
+            if pag_fin_fisica >= pag_sig_fisica:
+                pag_fin_fisica = max(pag_inicio_fisica, pag_sig_fisica - 1)
+
+            pag_candidata_separador = pag_sig_fisica - 1
+            if pag_candidata_separador > pag_inicio_fisica and pag_candidata_separador <= total_paginas:
+                txt_sep = reader.pages[pag_candidata_separador - 1].extract_text() or ""
+                txt_sep_norm = _normalizar_texto_busqueda(txt_sep)
+                if len(txt_sep.strip()) < 300 and any(w in txt_sep_norm for w in ["parte", "part", "seccion", "bloque"]):
+                    if pag_fin_fisica >= pag_candidata_separador:
+                        pag_fin_fisica = pag_candidata_separador - 1
+
+        paginas_caratula = res_dict.get("paginas_caratula_fisicas") or []
+        if not isinstance(paginas_caratula, list) or not paginas_caratula:
+            if paginas_con_indice:
+                paginas_caratula = sorted(list(set([1] + paginas_con_indice[:2])))
+            else:
+                paginas_caratula = [1, 2] if total_paginas >= 2 else [1]
+        else:
+            paginas_caratula = [p for p in paginas_caratula if isinstance(p, int) and 1 <= p <= total_paginas]
+            if 1 not in paginas_caratula and total_paginas >= 1:
+                paginas_caratula = [1] + paginas_caratula
+
+        print(
+            f"  [RECORTE ÍNDICE APROBADO] Rango físico: págs. {pag_inicio_fisica}-{pag_fin_fisica} "
+            f"(offset: {offset}, carátula: {paginas_caratula})",
+            file=sys.stderr,
+        )
+        return paginas_caratula, pag_inicio_fisica, pag_fin_fisica
+    except Exception as e:
+        print(f"  [WARN] Error consultando índice con DeepSeek: {e}", file=sys.stderr)
+        return None
 
 
 def descargar_y_extraer_texto_pdf(
@@ -874,6 +1071,8 @@ def descargar_y_extraer_texto_pdf(
     titulo_rdu: str = "",
     autores_rdu: list[str] | None = None,
     rango_sugerido: tuple[int, int] | None = None,
+    client_ai: OpenAI | None = None,
+    deepseek_model: str = "deepseek-chat",
 ) -> tuple[str, str, dict]:
     """Descarga el PDF (o convierte Word doc/docx a PDF si es necesario),
     detecta si es un libro completo para recortar el capítulo correspondiente
@@ -999,7 +1198,26 @@ def descargar_y_extraer_texto_pdf(
 
         # DETECCIÓN Y RECORTE DE PARTE DE LIBRO (BOOKPART) EN PDFS EXTENSOS
         if num_paginas > 4 and titulo_rdu:
-            loc = localizar_capitulo_en_pdf(reader, titulo_rdu, autores_rdu, rango_sugerido)
+            loc = None
+            if rango_sugerido and len(rango_sugerido) == 2:
+                p_ini, p_fin = rango_sugerido
+                if 1 <= p_ini <= num_paginas and p_ini <= p_fin <= num_paginas:
+                    paginas_caratula = [1, 2] if p_ini > 2 else [1]
+                    loc = (paginas_caratula, p_ini, p_fin)
+
+            if not loc and client_ai:
+                loc = localizar_capitulo_con_indice_deepseek(
+                    client_ai=client_ai,
+                    model=deepseek_model,
+                    reader=reader,
+                    titulo_rdu=titulo_rdu,
+                    autores_rdu=autores_rdu,
+                    total_paginas=num_paginas,
+                )
+
+            if not loc:
+                loc = localizar_capitulo_en_pdf(reader, titulo_rdu, autores_rdu, rango_sugerido)
+
             if loc:
                 paginas_caratula, pag_inicio, pag_fin = loc
                 print(
@@ -1800,6 +2018,8 @@ def procesar_flujo(
                 titulo_rdu=titulo_rdu,
                 autores_rdu=autores_rdu,
                 rango_sugerido=item.get("rango_paginas_md"),
+                client_ai=client_ai,
+                deepseek_model=deepseek_model,
             )
             if not texto_pdf:
                 print(f"  [OMITIDO] No se pudo extraer texto del PDF: {det_pdf}")
